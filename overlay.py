@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from PIL import Image, ImageDraw, ImageTk
 from types import SimpleNamespace
 
 # 打包成无控制台程序时 stdout/stderr 是 None，print 会报错 —— 兜一下
@@ -42,6 +43,11 @@ BG = "#15171c"
 FG = "#f2f4f7"
 DIM = "#8b93a1"
 ERR = "#ff6b6b"
+EDGE = "#2e3440"          # 圆角描边（比底色略亮一点，边界更清楚）
+RADIUS = 12               # 圆角半径
+EDGE_PAD = 14             # 内容到窗口边缘的留白（给圆角让位，四周一致）
+CHROMA = "#0b0c10"        # Windows/Linux 的透明色键（几乎不会出现在内容里的颜色）
+SYSTEM_TRANSPARENT = "systemTransparent"     # macOS 的透明背景色名
 # 风向箭头：按真实夹角 θ（0=正前，顺时针）取 8 向
 ARROWS8 = "↑↗→↘↓↙←↖"
 LAT_ARROW = {"向右": "→", "向左": "←"}          # 横向分量（左右）
@@ -70,7 +76,6 @@ def ui_font(size: int, bold: bool = True):
 
 
 HEAD_SIZE = 24                 # 两行同一个字号：第一行 箭头+风速+夹角，第二行 横向/纵向分量
-PAD = 0                        # 左右留白；0 = 窗口宽度就是第一行的宽度（第二行字小，顶不出窗口）
 GAP = 10                       # 同一行里两项之间的间距（两行共用一个值）
 # 量窗口尺寸用的"最长一行"样本（定死尺寸，文字变长也不会跑出屏幕）
 SAMPLES = (("↘  15 m/s", "+179.9°", "→ 13.55", "↑ 13.55"),   # 正常结果的最宽一拍
@@ -137,44 +142,56 @@ class Overlay:
             self.root.attributes("-alpha", args.alpha)  # 半透明
         except Exception:
             pass
-        self.root.configure(bg=BG)
+        self.transparent = self._enable_transparency()
 
+        # 圆角背景画在 Canvas 上（圆角外用真透明，露出桌面），内容用 create_window 居中放进去
+        self.canvas = tk.Canvas(self.root, highlightthickness=0, bd=0,
+                                bg=SYSTEM_TRANSPARENT if self.transparent else BG)
+        self.canvas.pack(fill="both", expand=True)
+        self._bg = None
+
+        body = tk.Frame(self.canvas, bg=BG)      # 只是内容容器，尺寸跟着两行文字走
         # 第一行：风向箭头 + 风速（按档位着色）+ 夹角，整行水平居中
-        head = tk.Frame(self.root, bg=BG)
-        head.pack(padx=PAD, pady=(6, 0))
+        head = tk.Frame(body, bg=BG)
+        head.pack()
         self.l_wind = tk.Label(head, text="·  --", font=ui_font(HEAD_SIZE), bg=BG, fg=FG)
         self.l_wind.pack(side="left")
         self.l_ang = tk.Label(head, text="", font=ui_font(HEAD_SIZE), bg=BG, fg=FG)
         self.l_ang.pack(side="left", padx=(GAP, 0))
 
         # 第二行：横向 + 纵向，排法和第一行一样 —— 两项并排 + 同间距，整组居中
-        row = tk.Frame(self.root, bg=BG)
-        row.pack(padx=PAD, pady=(0, 8))
+        row = tk.Frame(body, bg=BG)
+        row.pack(pady=(2, 0))
         self.l_lat = tk.Label(row, text="", font=ui_font(HEAD_SIZE), bg=BG, fg=DIM)
         self.l_lat.pack(side="left")
         self.l_lon = tk.Label(row, text="", font=ui_font(HEAD_SIZE), bg=BG, fg=DIM)
         self.l_lon.pack(side="left", padx=(GAP, 0))
 
-        # 宽度以第一行为准（第一行居中，左右各留 PAD）；高度取两行的自然高度。
-        # 尺寸定死，文字变长也不会跑出屏幕。
+        # 尺寸：内容自然大小 + 四周留白（定死，文字变长也不会跑出屏幕）
         self.win_w = self.win_h = 0
         labs = (self.l_wind, self.l_ang, self.l_lat, self.l_lon)
         for sample in SAMPLES:
             for lab, txt in zip(labs, sample):
                 lab.config(text=txt)
             self.root.update_idletasks()
-            # 宽度以第一行为准；第二行万一更宽也只补到不叠字为止
-            self.win_w = max(self.win_w, head.winfo_reqwidth() + 2 * PAD,
-                             row.winfo_reqwidth() + 2 * PAD)
-            self.win_h = max(self.win_h, self.root.winfo_reqheight())
-        self.win_w, self.win_h = max(self.win_w, 200), max(self.win_h, 60)   # 兜底
-        self.text_px = max(80, self.win_w - 2 * PAD - 6)   # 第一行提示可用的像素宽
+            self.win_w = max(self.win_w, body.winfo_reqwidth())
+            self.win_h = max(self.win_h, body.winfo_reqheight())
+        self.win_w = max(self.win_w + 2 * EDGE_PAD, 200)     # 兜底
+        self.win_h = max(self.win_h + 2 * EDGE_PAD, 60)
+        self.text_px = max(80, self.win_w - 2 * EDGE_PAD - 6)   # 第一行提示可用的像素宽
+
+        # 圆角底图 + 内容居中
+        if self.transparent:      # 透明可用才画圆角；不支持（少数 Tk）就退回原来的直角实心
+            self._bg = self._rounded_bg(self.win_w, self.win_h)
+            self.canvas.create_image(0, 0, anchor="nw", image=self._bg)
+        self.canvas.create_window(self.win_w / 2, self.win_h / 2,
+                                  window=body, anchor="center")
         self.l_wind.config(text="·  --")
         self.l_ang.config(text="")
         self.l_lat.config(text="")
         self.l_lon.config(text="")
 
-        widgets = (self.root, head, self.l_wind, self.l_ang,
+        widgets = (self.root, self.canvas, body, head, self.l_wind, self.l_ang,
                    row, self.l_lat, self.l_lon)
         for w in widgets:                             # 拖动
             w.bind("<Button-1>", self._press)
@@ -188,6 +205,38 @@ class Overlay:
         self._place()
         Reader(self.q, self.stop).start()
         self.root.after(80, self._poll)
+
+    # ---- 圆角外观 ----
+    def _enable_transparency(self) -> bool:
+        """让窗口背景真透明（圆角外露出桌面）。macOS 用 systemTransparent，Windows 用色键；
+        都不支持（少数 Linux/旧 Tk）就退回直角实心，功能照常。"""
+        try:
+            if sys.platform == "darwin":
+                self.root.configure(bg=SYSTEM_TRANSPARENT)
+                self.root.attributes("-transparent", True)
+                return True
+            if sys.platform.startswith("win"):
+                self.root.configure(bg=CHROMA)
+                self.root.attributes("-transparentcolor", CHROMA)
+                return True
+        except Exception:
+            pass
+        self.root.configure(bg=BG)
+        return False
+
+    def _rounded_bg(self, w: int, h: int):
+        """画一张圆角矩形背景（4× 超采样抗锯齿）并转成 Tk 图片对象。"""
+        ss = 4
+        img = Image.new("RGBA", (w * ss, h * ss), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.rounded_rectangle([0, 0, w * ss - 1, h * ss - 1], radius=RADIUS * ss,
+                               fill=self._rgb(BG), outline=self._rgb(EDGE), width=ss)
+        return ImageTk.PhotoImage(img.resize((w, h), Image.LANCZOS))
+
+    @staticmethod
+    def _rgb(hex_color: str) -> tuple[int, int, int, int]:
+        h = hex_color.lstrip("#")
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 255)
 
     # ---- 窗口位置 ----
     def _place(self) -> None:
