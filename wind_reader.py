@@ -1245,12 +1245,7 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
         fr.ok, fr.no_wind, fr.speed = True, True, 0.0
         fr.message = "风速 0 m/s —— 无风，按规则跳过计算"
         return fr
-    # 超采样按风盘半径自动（1080p 下 r≈115 → 2 倍，和固定值一致）；
-    # 抓图降档到 720p 后 r≈77 → 自动升到 3 倍，测角精度不掉。
-    if supersample:
-        ss = max(1, int(supersample))
-    else:
-        ss = min(4, max(SUPERSAMPLE, int(round(260.0 / max(dial.r, 1)))))
+    ss = max(1, int(supersample or SUPERSAMPLE))
     band = wind_color(fr.speed)          # 先有风速，才知道箭头该是什么颜色
     arrow = measure_arrow(rgb, hsv, dial, supersample=ss, band=band)
     if arrow is None:
