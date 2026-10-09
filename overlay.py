@@ -66,7 +66,8 @@ def wind_arrow(theta: float) -> str:
     return ARROWS8[int((theta % 360.0) / 45.0 + 0.5) % 8]
 
 
-HOLD_BAD = 3           # 连续这么多次"没识别出来"才把提示刷到窗口（中间保持上一帧，避免闪烁）
+HOLD_SEC = 2.5        # 没识别出来时，最多按住上一帧多少秒；超过才把提示刷到窗口
+                      # （按时间算而不是按帧数：慢机器上一帧要 2~3 秒，按帧数会"卡"很久）
 
 
 def ui_font(size: int, bold: bool = True):
@@ -89,8 +90,8 @@ class Reader(threading.Thread):
         super().__init__(daemon=True)
         self.out, self.stop = out, stop
         self.verbose = verbose
-        self.bad = 0                 # 连续"没识别出来"的次数
         self.have_good = False       # 是否出过至少一次好结果
+        self.last_ok = 0.0           # 上一次识别成功的时间
 
     def run(self) -> None:
         src = rec = None
@@ -127,17 +128,15 @@ class Reader(threading.Thread):
                 self._log(f"取帧 {t_read*1000:.0f}ms（请求 {tq*1000:.0f} / 解码 {td*1000:.0f}）"
                           f" | 识别 {t_rec*1000:.0f}ms | 风速 {st.get('speed')} "
                           f"θ={st.get('theta') and round(st['theta'], 1)}")
-            # 偶发单帧没识别出来（转身/遮挡/动画中）先按住上一帧，别让窗口闪一下"未识别"；
-            # 连续 HOLD_BAD 次都失败才把原因显示出来。还没出过好结果时（刚启动、没在瞄准界面）立刻显示。
+            # 偶发单帧没识别出来（转身/遮挡/动画中）先按住上一帧，窗口保持上一次的结果；
+            # 超过 HOLD_SEC 秒都没成功才把原因显示出来。还没出过好结果时（刚启动、没在瞄准界面）立刻显示。
             if st.get("ok"):
-                self.bad, self.have_good = 0, True
-            else:
-                self.bad += 1
-                if self.have_good and self.bad < HOLD_BAD:
-                    rest = 1.0 / O.FPS - (time.time() - t0)
-                    if rest > 0:
-                        self.stop.wait(rest)
-                    continue
+                self.have_good, self.last_ok = True, time.time()
+            elif self.have_good and time.time() - self.last_ok < HOLD_SEC:
+                rest = 1.0 / O.FPS - (time.time() - t0)
+                if rest > 0:
+                    self.stop.wait(rest)
+                continue
             st["kind"] = "result"
             self.out.put(st)
             rest = 1.0 / O.FPS - (time.time() - t0)     # 固定 1 次/秒
