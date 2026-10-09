@@ -117,8 +117,11 @@ class Reader(threading.Thread):
                 self.stop.wait(1.0)
                 continue
             if self.verbose:                      # 诊断：每帧耗时写日志，定位"慢在哪一段"
-                self._log(f"取帧 {t_read*1000:.0f}ms | 识别 {t_rec*1000:.0f}ms | "
-                          f"风速 {st.get('speed')} θ={st.get('theta') and round(st['theta'], 1)}")
+                tq, td = getattr(src, "last_timing", (0.0, 0.0))
+                self._log(f"取帧 {t_read*1000:.0f}ms（请求 {tq*1000:.0f} / 解码 {td*1000:.0f}）"
+                          f" | 识别 {t_rec*1000:.0f}ms | 风速 {st.get('speed')} "
+                          f"θ={st.get('theta') and round(st['theta'], 1)}"
+                          f"{' | 已降档' if getattr(src, 'degraded', False) else ''}")
             st["kind"] = "result"
             self.out.put(st)
             rest = 1.0 / O.FPS - (time.time() - t0)     # 固定 1 次/秒

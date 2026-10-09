@@ -37,6 +37,8 @@ QUALITY = 100                      # OBS 抓图 JPEG 质量 —— 固定 100（
 OBS_HOST = "127.0.0.1"             # OBS WebSocket 地址（端口/密码读 OBS 自己的配置）
 REQ_TIMEOUT = 2                    # 单次请求超时（秒）；别设大，请求卡住时要尽快失败好重连
 WIDTH, HEIGHT = 1920, 1080         # 抓图分辨率（相对先验定位 / 固定 2× 超采样都按这个标定）
+SLOW_MS = 1000                     # 取帧平均耗时超过它就自动降档（老机器/虚拟机里 OBS 编码很贵）
+CHEAP = (1280, 720, 85)            # 降档参数：宽、高、JPEG 质量（大分辨率/高质量在慢机器上是瓶颈）
 
 # 采集卡类输入源的 inputKind（OBS 的类型标识，与界面语言无关）
 CAPTURE_INPUT_KINDS = (
@@ -121,6 +123,9 @@ class ObsWebSocketSource:
         self.last_error = ""                         # 最近一次取帧失败的原因
         self.fails = 0                               # 连续失败次数
         self.dead = False                            # 连接/源已经救不回来，该重连
+        self.degraded = False                        # 是否已自动降档（慢机器）
+        self.read_ms: list[float] = []               # 最近几次取帧耗时，用来判断要不要降档
+        self.last_timing: tuple[float, float] = (0.0, 0.0)   # (请求, 解码) 秒，诊断用
         self._connect()
 
     def _connect(self) -> None:
@@ -204,21 +209,41 @@ class ObsWebSocketSource:
         取一帧。失败返回 None，并把原因记在 last_error；连续失败到 RECONNECT_FAILS
         就把 dead 置 True —— 调用方看到 dead 应该重建连接（顺便重新挑源）。
         """
+        t0 = time.time()
         try:
             r = self.cli.get_source_screenshot(
                 self.source, self.fmt, self.width, self.height, self.quality)
         except Exception as exc:
             self._fail(f"{exc}")
             return None
+        t_req = time.time() - t0
         data = getattr(r, "image_data", "") or ""
         if data.startswith("data:"):
             data = data.split(",", 1)[-1]
         try:
+            t1 = time.time()
             with Image.open(io.BytesIO(base64.b64decode(data))) as im:
-                return np.asarray(im.convert("RGB"))
+                arr = np.asarray(im.convert("RGB"))
         except Exception:
             self._fail("画面解码失败（JPEG 数据异常）")
             return None
+        t_dec = time.time() - t1
+        self.last_timing = (t_req, t_dec)
+        self._check_speed((t_req + t_dec) * 1000.0)
+        return arr
+
+    def _check_speed(self, ms: float) -> None:
+        """取帧持续偏慢就自动降档 —— 慢机器上瓶颈几乎全在 OBS 编码 1080p JPEG。"""
+        self.read_ms.append(ms)
+        del self.read_ms[:-6]                        # 只看最近 6 次
+        if self.degraded or len(self.read_ms) < 6:
+            return
+        avg = sum(self.read_ms) / len(self.read_ms)
+        if avg > SLOW_MS:
+            self.width, self.height, self.quality = CHEAP
+            self.degraded = True
+            print(f"[取帧] 平均 {avg:.0f}ms 偏慢 → 自动降档到 "
+                  f"{self.width}×{self.height} q{self.quality}（测角超采样会自动补偿）")
 
     def _fail(self, why: str) -> None:
         self.last_error = why
