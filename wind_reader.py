@@ -57,7 +57,7 @@ SUPERSAMPLE = 2
 # --------------------------------------------------------------------------
 # 其余阈值
 # --------------------------------------------------------------------------
-KIND_GAUGE = "gauge3d"       # 右上角 3D 风盘
+KIND_GAUGE = "gauge3d"       # 3D 风盘（右手右上 / 左手左上）
 DEFAULT_K = CONFIG.k_default
 CYAN_H = (158.0, 218.0)      # 兼容旧判据
 CYAN_S = 0.15
@@ -281,9 +281,12 @@ def arrow_mask_band(hsv: np.ndarray, band: tuple[float, float, float, float]) ->
 # 2. 风盘定位
 # --------------------------------------------------------------------------
 
-# 风盘位置的固定先验（相对整幅画面）：右手=右上，左手=左右镜像。
-# 实测 1920×1080 采集：中心 (1690,140)、半径 115 → (0.880W, 0.130H, 0.060W)。
-GAUGE_PRIOR = (0.8802, 0.1296, 0.0600)      # cx/W, cy/H, r/W
+# 风盘先验（cx/W, cy/H, r/W）—— 按 1920×1080 采集实测：
+#   右手：右上角，中心 (1690,140)、半径 115；
+#   左手：HUD 左右**完全对称**，风盘挪到左上角，大小位置都是镜像（别再改成缩小版）。
+GAUGE_PRIOR = (0.8802, 0.1296, 0.0600)
+GAUGE_PRIOR_LEFT = (1.0 - GAUGE_PRIOR[0], GAUGE_PRIOR[1], GAUGE_PRIOR[2])
+GAUGE_PRIORS = (("右", GAUGE_PRIOR), ("左", GAUGE_PRIOR_LEFT))
 
 @dataclass
 class Dial:
@@ -302,10 +305,21 @@ def _ring_coverage(pts: np.ndarray, cx: float, cy: float, nbins: int = 72) -> fl
     return len(np.unique((ang / (360.0 / nbins)).astype(int) % nbins)) / nbins
 
 
-def _in_gauge_zone(cx: float, cy: float, shape) -> bool:
-    """风盘永远在画面右上角。"""
+def _in_gauge_zone(cx: float, cy: float, shape, side: str | None = None) -> bool:
+    """
+    风盘在画面上方**任一角**：右手在右上，左手（HUD 镜像）在左上。
+
+    side 给定时只认那一侧 —— 玩家一局之内不会换手，锁定侧别可以彻底避免
+    "在对侧误抓一个白色 UI 当风盘"（那种情况下会一直报"风速未识别"）。
+    """
     h, w = shape[:2]
-    return cx >= 0.70 * w and cy <= 0.30 * h
+    if cy > 0.30 * h:
+        return False
+    if side == "右":
+        return cx >= 0.70 * w
+    if side == "左":
+        return cx <= 0.30 * w
+    return cx >= 0.70 * w or cx <= 0.30 * w
 
 
 def _fit_ellipse_4pt(pts: np.ndarray):
@@ -388,7 +402,7 @@ def _fit_disc_local(rgb: np.ndarray, cx: float, cy: float, half: int,
     min_a = max(60, int(0.00012 * rgb.shape[0] * rgb.shape[1]))
     comps = label_components(vivid, keep_pixels=True, min_area=min_a)
     if not comps:
-        return None
+        return []
     comp = comps[0]
     px = comp.pixels
     top: dict[int, int] = {}
@@ -425,7 +439,8 @@ def _disc_has_arrow(arrow: np.ndarray, fit: dict, min_px: int = 120) -> bool:
 
 
 def _find_dial_by_arrow_color(rgb: np.ndarray, hsv: np.ndarray, arrow: np.ndarray,
-                              verbose: bool = False) -> Dial | None:
+                              verbose: bool = False,
+                              side: str | None = None) -> Dial | None:
     """箭头颜色锚点定位；半径取先验 panel_r_frac×画面宽（比从箭头尺寸反推可靠）。"""
     img_h, img_w = rgb.shape[:2]
     am = arrow.copy()                    # 复用已算好的三色掩膜，避免整帧重算
@@ -437,7 +452,7 @@ def _find_dial_by_arrow_color(rgb: np.ndarray, hsv: np.ndarray, arrow: np.ndarra
     comps = label_components(am, keep_pixels=True, min_area=min_a)
     cands = []
     for c in comps:
-        if not _in_gauge_zone(c.cx, c.cy, rgb.shape):
+        if not _in_gauge_zone(c.cx, c.cy, rgb.shape, side):
             continue
         if c.area > 0.05 * img_h * img_w:
             continue
@@ -470,7 +485,8 @@ def _find_dial_by_arrow_color(rgb: np.ndarray, hsv: np.ndarray, arrow: np.ndarra
 
 
 def _find_dial_by_disc(rgb: np.ndarray, arrow: np.ndarray,
-                       verbose: bool = False) -> Dial | None:
+                       verbose: bool = False,
+                       side: str | None = None) -> Dial | None:
     """草地圆盘锚点：找鲜绿圆盘 -> 上沿 RANSAC 椭圆 -> 半径/中心/k。"""
     R = rgb[..., 0].astype(np.int16); G = rgb[..., 1].astype(np.int16)
     B = rgb[..., 2].astype(np.int16)
@@ -510,7 +526,7 @@ def _find_dial_by_disc(rgb: np.ndarray, arrow: np.ndarray,
             continue        # 半径离先验太远：多半拟合到别的东西
         if abs(2 * fit["a"] - comp.w) / max(comp.w, 1) > 0.25:
             continue
-        if not _in_gauge_zone(fit["cx"], fit["cy"], rgb.shape):
+        if not _in_gauge_zone(fit["cx"], fit["cy"], rgb.shape, side):
             continue
         if not _disc_has_arrow(arrow, fit):
             continue
@@ -530,7 +546,8 @@ def _find_dial_by_disc(rgb: np.ndarray, arrow: np.ndarray,
 
 
 def _find_dial_by_arrow(rgb: np.ndarray, arrow: np.ndarray,
-                        verbose: bool = False) -> Dial | None:
+                        verbose: bool = False,
+                        side: str | None = None) -> Dial | None:
     """再兜底：箭头团块定位 + 局部草地拟合 k。"""
     img_h, img_w = rgb.shape[:2]
     min_a = max(40, int(0.00015 * img_w * img_h))
@@ -541,7 +558,7 @@ def _find_dial_by_arrow(rgb: np.ndarray, arrow: np.ndarray,
         d0 = max(comp.w, comp.h)
         if d0 < 14 or d0 / max(min(comp.w, comp.h), 1) > 5.0:
             continue
-        if not _in_gauge_zone(comp.cx, comp.cy, rgb.shape):
+        if not _in_gauge_zone(comp.cx, comp.cy, rgb.shape, side):
             continue
         r_prior = CONFIG.panel_r_frac * img_w
         fit = _fit_disc_local(rgb, comp.cx,
@@ -551,7 +568,7 @@ def _find_dial_by_arrow(rgb: np.ndarray, arrow: np.ndarray,
             continue
         if not (0.72 * r_prior <= fit["a"] / CONFIG.disc_panel_ratio <= 1.32 * r_prior):
             continue
-        if not _in_gauge_zone(fit["cx"], fit["cy"], rgb.shape):
+        if not _in_gauge_zone(fit["cx"], fit["cy"], rgb.shape, side):
             continue
         d = Dial(kind=KIND_GAUGE, cx=fit["cx"], cy=fit["cy"],
                  r=fit["a"] / CONFIG.disc_panel_ratio,
@@ -562,18 +579,20 @@ def _find_dial_by_arrow(rgb: np.ndarray, arrow: np.ndarray,
     return None
 
 
-def _find_dial_by_prior(rgb: np.ndarray, verbose: bool = False) -> Dial | None:
+def _find_dial_by_prior(rgb: np.ndarray, verbose: bool = False,
+                        side: str | None = None) -> Dial | None:
     """
-    按固定先验定位（最快路径）：在右上（左手则左上）先验小窗里找草地圆盘。
+    按固定先验定位（最快路径）：右手在右上、左手在左上，各自的先验小窗里找草地圆盘。
     圆盘在（含 0 m/s），且左右手可由此区分；找到就直接用先验的中心/半径。
     先验只用来"开窗"，找不到就返回 None，交给后面的完整搜索。
+    side 给定时只试那一侧（玩家锁定左右手后就不再换）。
     """
     img_h, img_w = rgb.shape[:2]
-    fx, fy, fr = GAUGE_PRIOR
-    r = fr * img_w
-    half = int(r * 1.5)
-    for side, cx in (("右", fx * img_w), ("左", (1.0 - fx) * img_w)):
-        cy = fy * img_h
+    for name, (fx, fy, fr) in GAUGE_PRIORS:
+        if side is not None and name != side:
+            continue
+        cx, cy, r = fx * img_w, fy * img_h, fr * img_w
+        half = int(r * 1.5)
         x0, x1 = int(max(cx - half, 0)), int(min(cx + half, img_w))
         y0, y1 = int(max(cy - half, 0)), int(min(cy + half, img_h))
         if x1 - x0 < 20 or y1 - y0 < 20:
@@ -593,17 +612,20 @@ def _find_dial_by_prior(rgb: np.ndarray, verbose: bool = False) -> Dial | None:
         if math.hypot((x0 + c.cx) - cx, (y0 + c.cy) - exp_cy) > 0.5 * r:
             continue
         d = Dial(kind=KIND_GAUGE, cx=float(cx), cy=float(cy), r=float(r),
-                 k=DEFAULT_K, anchored_by=f"prior-{side}")
+                 k=DEFAULT_K, anchored_by=f"prior-{name}")
         if verbose:
-            print(f"[定位] 先验({side})：圆盘 {c.w}×{c.h} -> 中心=({cx:.0f},{cy:.0f}) r={r:.0f}")
+            print(f"[定位] 先验({name})：圆盘 {c.w}×{c.h} -> 中心=({cx:.0f},{cy:.0f}) r={r:.0f}")
         return d
     return None
 
 
 def find_dials(rgb: np.ndarray, hsv: np.ndarray | None = None,
-               verbose: bool = False) -> list[Dial]:
-    """找右上角 3D 风盘：先试固定先验，失败再走白环 / 箭头锚点 / 草地圆盘搜索。"""
-    d0 = _find_dial_by_prior(rgb, verbose)
+               verbose: bool = False, side: str | None = None) -> list[Dial]:
+    """
+    找 3D 风盘：先试固定先验，失败再走白环 / 箭头锚点 / 草地圆盘搜索。
+    side="右"/"左" 时只搜那一侧（调用方锁定左右手后用）。
+    """
+    d0 = _find_dial_by_prior(rgb, verbose, side)
     if d0 is not None:
         return [d0]
     if hsv is None:                      # 先验没命中才需要整帧 HSV
@@ -632,6 +654,10 @@ def find_dials(rgb: np.ndarray, hsv: np.ndarray | None = None,
         ring_pts = px[(d > 0.6 * r) & (d < 1.15 * r)]
         if len(ring_pts) >= 24:
             cx, cy, r = fit_circle_ls(ring_pts)
+        # 白环候选必须先落在"风盘该在的区域"（上方任一角；锁定左右手后只认那一侧）——
+        # 原来这里没有区域检查，会画面里随便一个白圆环（小地图框、名字条）都被当成风盘。
+        if not _in_gauge_zone(cx, cy, rgb.shape, side):
+            continue
         if not (12 <= r <= 0.35 * min(img_h, img_w)):
             continue
         cov = _ring_coverage(ring_pts, cx, cy)
@@ -671,9 +697,9 @@ def find_dials(rgb: np.ndarray, hsv: np.ndarray | None = None,
         merged.append(d)
 
     if not merged:
-        d2 = (_find_dial_by_arrow_color(rgb, hsv, cyan, verbose)
-              or _find_dial_by_disc(rgb, cyan, verbose)
-              or _find_dial_by_arrow(rgb, cyan, verbose))
+        d2 = (_find_dial_by_arrow_color(rgb, hsv, cyan, verbose, side)
+              or _find_dial_by_disc(rgb, cyan, verbose, side)
+              or _find_dial_by_arrow(rgb, cyan, verbose, side))
         if d2 is not None:
             merged = [d2]
     else:
@@ -974,18 +1000,20 @@ def _digit_runs(crop: Image.Image, height_ratio: float,
     return out
 
 
-def _find_text_roi(rgb: np.ndarray, dial: Dial) -> tuple[int, int, int, int] | None:
+def _find_text_lines(rgb: np.ndarray, dial: Dial,
+                     max_lines: int = 3) -> list[tuple[int, int, int, int]]:
     """
-    在风盘下方区域找"白色文字行"（排除细长的分隔线），返回文本框。
-    比固定相对框稳：不同模式/缩放下文字位置和大小都会变。
+    在风盘下方区域找"白色文字行"（排除细长的分隔线），返回若干候选文本框
+    （左手/右手完全对称，文字与圆环的相对位置一致，按半径比例带即可）。
     """
     img_h, img_w = rgb.shape[:2]
     r = dial.r
     x0 = int(max(dial.cx - 1.15 * r, 0)); x1 = int(min(dial.cx + 1.15 * r, img_w))
     # "Nm/s" 落在圆盘下方一条窄带里（cy+0.10r ~ 1.05r）；再往下是"高低差/返回"图标行
-    y0 = int(max(dial.cy + 0.10 * r, 0)); y1 = int(min(dial.cy + 1.05 * r, img_h))
+    y0 = int(max(dial.cy + 0.10 * r, 0))
+    y1 = int(min(dial.cy + 1.05 * r, img_h))
     if x1 - x0 < 20 or y1 - y0 < 12:
-        return None
+        return []
     # 只在这条窄带里算 HSV（整帧 HSV 约 70ms）
     hsv = rgb_to_hsv(rgb[y0:y1, x0:x1])
     m = (hsv[..., 2] > 0.55) & (hsv[..., 1] < 0.45)
@@ -1009,16 +1037,23 @@ def _find_text_roi(rgb: np.ndarray, dial: Dial) -> tuple[int, int, int, int] | N
                 break
         if not placed:
             lines.append([c])
-    line = max(lines, key=lambda ln: sum(z.area for z in ln))
     # 真文字由多个字块组成（数字 + m + / + s）；单个杂斑（如过场横幅）直接判掉
-    if not (len(line) >= 2 or (len(line) == 1 and line[0].w >= 0.35 * r)):
-        return None
-    X0 = min(c.x0 for c in line); X1 = max(c.x1 for c in line)
-    Y0 = min(c.y0 for c in line); Y1 = max(c.y1 for c in line)
-    anchor = max(line, key=lambda c: c.area)
-    pad = max(4, int(0.12 * anchor.h))
-    return (max(X0 + x0 - pad, 0), max(Y0 + y0 - pad, 0),
-            min(X1 + x0 + pad, img_w), min(Y1 + y0 + pad, img_h))
+    lines = [ln for ln in lines
+             if len(ln) >= 2 or (len(ln) == 1 and ln[0].w >= 0.35 * r)]
+    if not lines:
+        return []
+    # 按面积从大到小给候选 —— 最大的那块未必是数字行（左手/其它布局下会变），
+    # 所以交给调用方依次试，别只赌第一名。
+    lines.sort(key=lambda ln: -sum(z.area for z in ln))
+    boxes = []
+    for line in lines[:max_lines]:
+        X0 = min(c.x0 for c in line); X1 = max(c.x1 for c in line)
+        Y0 = min(c.y0 for c in line); Y1 = max(c.y1 for c in line)
+        anchor = max(line, key=lambda c: c.area)
+        pad = max(4, int(0.12 * anchor.h))
+        boxes.append((max(X0 + x0 - pad, 0), max(Y0 + y0 - pad, 0),
+                      min(X1 + x0 + pad, img_w), min(Y1 + y0 + pad, img_h)))
+    return boxes
 
 
 def ocr_speed(rgb: np.ndarray, dial: Dial, state: OcrState | None = None) -> dict:
@@ -1028,18 +1063,18 @@ def ocr_speed(rgb: np.ndarray, dial: Dial, state: OcrState | None = None) -> dic
     """
     state = state or _DEFAULT_OCR
     res = dict(value=None, raw="", conf=0.0, box=None, ok=False)
-    found_roi = _find_text_roi(rgb, dial)
-    if found_roi is None:
-        return res
-    x0, y0, x1, y1 = found_roi
-    res["box"] = [x0, y0, x1, y1]
-    tm = match_glyphs(Image.fromarray(rgb[y0:y1, x0:x1]), state=state)
-    if tm is None:
-        return res
-    val = int(tm[0])
-    # match_glyphs 已保证每字形 ≥0.72 且有区分度；这里只要一个绝对下限
-    if 0 <= val <= 60 and tm[1] >= 0.80:
-        res.update(value=val, raw=f"tpl:{tm[0]}", conf=tm[1], ok=True)
+    # 候选文字行按面积从大到小依次试，第一个匹配上的就是风速
+    for roi in _find_text_lines(rgb, dial):
+        x0, y0, x1, y1 = roi
+        res["box"] = [x0, y0, x1, y1]
+        tm = match_glyphs(Image.fromarray(rgb[y0:y1, x0:x1]), state=state)
+        if tm is None:
+            continue
+        val = int(tm[0])
+        # match_glyphs 已保证每字形 ≥0.72 且有区分度；这里只要一个绝对下限
+        if 0 <= val <= 60 and tm[1] >= 0.80:
+            res.update(value=val, raw=f"tpl:{tm[0]}", conf=tm[1], ok=True)
+            return res
     return res
 
 

@@ -64,6 +64,7 @@ def _glyph_bank_path() -> str:
 GLYPH_BANK = _glyph_bank_path()
 RELOCATE_S = 1.5                   # 找不到风盘时的重试间隔（秒）
 RECONNECT_FAILS = 3                # 连续取帧失败这么多次就重连（顺便重新挑源）
+RELOCATE_BAD = 6                   # 连续这么多帧读不出来就丢掉缓存的定位，重新找一次
 HYST = 0.05                        # 横向/纵向 |值| 小于它就沿用上一次方向（0 附近不抖）
 FLIP_CONF = 0.6                    # 方向置信度低于此值时才做反 180° 保护
 FLIP_RUN = 3                       # 连续这么多次"反向"才认为真的转向了
@@ -264,6 +265,8 @@ class Recognizer:
         self.shape: tuple[int, int] | None = None
         self.last_locate_t = 0.0
         self.no_wind = False
+        self.side: str | None = None      # 锁定后的左右手（"右"/"左"），首次定位成功时确定
+        self.bad = 0                      # 连续读不出来的次数
         self.last_theta: float | None = None
         self.flip_run = 0                # 连续"反向"次数
         self.last_dir: dict[str, str] = {}   # 横向/纵向上一次的方向（做迟滞用）
@@ -275,14 +278,19 @@ class Recognizer:
 
     # ---- 定位 ----
     def locate(self, rgb) -> bool:
-        dials = W.find_dials(rgb, verbose=self.args.verbose)
+        # 第一次定位成功就锁定左右手（右/左），之后所有搜索只在这一侧 —— 玩家一局不会换手，
+        # 锁了之后就不会再跑到对侧误抓白色 UI 当风盘（那会一直报"风速未识别"）。
+        dials = W.find_dials(rgb, verbose=self.args.verbose, side=self.side)
         if not dials:
             return False
         d = dials[0]
         self.dial = d
         self.shape = rgb.shape[:2]
+        if self.side is None:
+            self.side = "右" if d.cx >= rgb.shape[1] / 2.0 else "左"
         if self.args.verbose:
-            print(f"\n[定位] 风盘 中心=({d.cx:.0f},{d.cy:.0f}) r={d.r:.0f} k={d.k:.3f}")
+            print(f"\n[定位] 风盘 中心=({d.cx:.0f},{d.cy:.0f}) r={d.r:.0f} k={d.k:.3f}"
+                  f" 侧别={'右' if d.cx >= rgb.shape[1] / 2.0 else '左'}")
         return True
 
     def recognize(self, rgb) -> dict:
@@ -290,16 +298,24 @@ class Recognizer:
         h, w = rgb.shape[:2]
         if self.dial is None or self.shape != (h, w):
             if time.time() - self.last_locate_t < RELOCATE_S:
-                return {"ok": False, "message": "未找到右上角风盘（可能不在瞄准界面）"}
+                return {"ok": False, "message": "未找到风盘"}
             self.last_locate_t = time.time()
             if not self.locate(rgb):
-                return {"ok": False, "message": "未找到右上角风盘（可能不在瞄准界面）"}
+                return {"ok": False, "message": "未找到风盘"}
 
         d = self.dial
         assert d is not None
 
         # 每帧都重新读风速（模板匹配只要 ~4ms，读准了才知道箭头该是什么颜色）
         fr = W.read_wind(rgb, d, ocr_state=self.ocr)
+        if fr.ok and fr.speed is not None:
+            self.bad = 0
+        else:
+            self.bad += 1
+            if self.bad >= RELOCATE_BAD:      # 一直读不出来：多半是定位错了（或界面切走又切回）
+                self.dial, self.side, self.bad = None, None, 0   # 清缓存，下帧重新定位+重判左右
+                if self.args.verbose:
+                    print("\n[定位] 连续读不出来 → 丢弃缓存，重新定位")
         if fr.ocr is not None and fr.ocr.get("value") is None and self.args.verbose:
             print("\n[风读] 未读出风速（等待下一次读取）")
         if fr.speed is None:
@@ -404,7 +420,7 @@ def print_test_report(st: dict, rgb) -> None:
         print(f"纵向风速    : {w['longitudinal_abs']:.2f} m/s {w['longitudinal_dir']}")
         print(f"耗时        : {st.get('latency_ms', 0):.0f} ms")
     if not st.get("ok") and st.get("dial") is None:
-        print("\n提示：请让游戏停在「瞄准 / 击球前」的画面（风盘在右上角），再跑一次。")
+        print("\n提示：请让游戏停在「瞄准 / 击球前」的画面（右上/左上角有风盘），再跑一次。")
     print("=" * 60)
 
 

@@ -125,9 +125,14 @@ class Reader(threading.Thread):
                 continue
             if self.verbose:                      # 诊断：每帧耗时写日志，定位"慢在哪一段"
                 tq, td = getattr(src, "last_timing", (0.0, 0.0))
+                d = st.get("dial")
+                where = f"风盘({d.cx:.0f},{d.cy:.0f}) r={d.r:.0f}" if d else "没定位到风盘"
+                ocr = st.get("ocr") or {}
+                if ocr.get("box"):
+                    where += f" 数字框{ocr['box']}" + (f" 放宽{ocr.get('widen')}" if ocr.get("widen") else "")
                 self._log(f"取帧 {t_read*1000:.0f}ms（请求 {tq*1000:.0f} / 解码 {td*1000:.0f}）"
                           f" | 识别 {t_rec*1000:.0f}ms | 风速 {st.get('speed')} "
-                          f"θ={st.get('theta') and round(st['theta'], 1)}")
+                          f"θ={st.get('theta') and round(st['theta'], 1)} | {where}")
             # 偶发单帧没识别出来（转身/遮挡/动画中）先按住上一帧，窗口保持上一次的结果；
             # 超过 HOLD_SEC 秒都没成功才把原因显示出来。还没出过好结果时（刚启动、没在瞄准界面）立刻显示。
             if st.get("ok"):
@@ -179,19 +184,19 @@ class Overlay:
         self.font = tkfont.Font(family=fam, size=size, weight=weight)
 
         # 第一行：风向箭头 + 风速（按档位着色）+ 夹角，整行水平居中
-        head = tk.Frame(self.root, bg=BG)
-        head.pack(padx=PAD, pady=(6, 0))
-        self.l_wind = tk.Label(head, text="·  --", font=self.font, bg=BG, fg=FG)
+        self.head = tk.Frame(self.root, bg=BG)
+        self.head.pack(padx=PAD, pady=(6, 0))
+        self.l_wind = tk.Label(self.head, text="·  --", font=self.font, bg=BG, fg=FG)
         self.l_wind.pack(side="left")
-        self.l_ang = tk.Label(head, text="", font=self.font, bg=BG, fg=FG)
+        self.l_ang = tk.Label(self.head, text="", font=self.font, bg=BG, fg=FG)
         self.l_ang.pack(side="left", padx=(GAP, 0))
 
         # 第二行：横向 + 纵向，排法和第一行一样 —— 两项并排 + 同间距，整组居中
-        row = tk.Frame(self.root, bg=BG)
-        row.pack(padx=PAD, pady=(0, 8))
-        self.l_lat = tk.Label(row, text="", font=self.font, bg=BG, fg=DIM)
+        self.row = tk.Frame(self.root, bg=BG)
+        self.row.pack(padx=PAD, pady=(0, 8))
+        self.l_lat = tk.Label(self.row, text="", font=self.font, bg=BG, fg=DIM)
         self.l_lat.pack(side="left")
-        self.l_lon = tk.Label(row, text="", font=self.font, bg=BG, fg=DIM)
+        self.l_lon = tk.Label(self.row, text="", font=self.font, bg=BG, fg=DIM)
         self.l_lon.pack(side="left", padx=(GAP, 0))
 
         # 宽度以第一行为准（第一行居中，左右各留 PAD）；高度取两行的自然高度。
@@ -203,18 +208,19 @@ class Overlay:
                 lab.config(text=txt)
             self.root.update_idletasks()
             # 宽度以第一行为准；第二行万一更宽也只补到不叠字为止
-            self.win_w = max(self.win_w, head.winfo_reqwidth() + 2 * PAD,
-                             row.winfo_reqwidth() + 2 * PAD)
+            self.win_w = max(self.win_w, self.head.winfo_reqwidth() + 2 * PAD,
+                             self.row.winfo_reqwidth() + 2 * PAD)
             self.win_h = max(self.win_h, self.root.winfo_reqheight())
         self.win_w, self.win_h = max(self.win_w, 200), max(self.win_h, 60)   # 兜底
         self.text_px = max(80, self.win_w - 2 * PAD - 6)   # 第一行提示可用的像素宽
+        self.cur_w = self.win_w                          # 当前窗口宽度（提示时会临时加宽）
         self.l_wind.config(text="·  --")
         self.l_ang.config(text="")
         self.l_lat.config(text="")
         self.l_lon.config(text="")
 
-        widgets = (self.root, head, self.l_wind, self.l_ang,
-                   row, self.l_lat, self.l_lon)
+        widgets = (self.root, self.head, self.l_wind, self.l_ang,
+                   self.row, self.l_lat, self.l_lon)
         for w in widgets:                             # 拖动
             w.bind("<Button-1>", self._press)
             w.bind("<B1-Motion>", self._drag)
@@ -235,6 +241,7 @@ class Overlay:
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         x = max(0, sw - w - 40)      # 贴右上角，留 40px 边距（游戏风盘也在右上，习惯一致）
         y = max(0, min(120, sh - h))
+        self.cur_w = w
         self.root.geometry(f"{w}x{h}+{int(x)}+{int(y)}")
 
     # ---- 拖动 ----
@@ -279,6 +286,8 @@ class Overlay:
             return
         else:
             self.ok = True
+            self._resize(self.win_w)          # 回到固定宽度
+            self.l_ang.pack_configure(padx=(GAP, 0))
             w = st["wind"]
             # 大行：风向箭头 + 总风速 + 夹角（夹角中性色）
             # 小行：横向 / 纵向分量
@@ -294,15 +303,32 @@ class Overlay:
                               fg=col)
 
     def _line1(self, text: str, color: str) -> None:
-        """把整句提示写进第一行（过长按窗口宽度截断），其余行清空。"""
-        self.l_wind.config(text=self._fit(text), fg=color)
+        """
+        整句提示写进第一行。窗口会临时加宽到**刚好放下这句话**（上限屏幕 90%），
+        这样左右留白自然相等、也不会被截断成"贴着左边"的样子；正常显示时再缩回固定宽度。
+        """
         self.l_ang.config(text="")
         self.l_lat.config(text="")
         self.l_lon.config(text="")
+        self.l_ang.pack_configure(padx=0)      # 夹角为空时不占位，提示才是真正左右居中
+        cap = int(self.root.winfo_screenwidth() * 0.90) - 2 * PAD - 8
+        shown = self._fit(text, cap)                  # 只有超过屏幕宽度时才截断
+        self.l_wind.config(text=shown, fg=color)
+        self.root.update_idletasks()
+        need = self.head.winfo_reqwidth() + 2 * PAD + 16   # 留 8px 左右边距，居中才看得出来
+        self._resize(max(self.win_w, need))
 
-    def _fit(self, text: str) -> str:
+    def _resize(self, w: int) -> None:
+        """改窗口宽度：贴住原来的右边缘（不跑出屏幕），高度不变。"""
+        sw = self.root.winfo_screenwidth()
+        w = int(min(max(w, self.win_w), sw - 20))
+        x = max(0, min(self.root.winfo_x() + self.cur_w - w, sw - w))
+        self.cur_w = w
+        self.root.geometry(f"{w}x{self.win_h}+{int(x)}+{self.root.winfo_y()}")
+
+    def _fit(self, text: str, limit: int | None = None) -> str:
         """用真实字体宽度截断提示（Tk 字号单位是点，估算必偏小、会顶出窗口）。"""
-        limit, font = self.text_px, self.font
+        limit, font = (self.text_px if limit is None else limit), self.font
         if font.measure(text) <= limit:
             return text
         lo, hi = 0, len(text)                      # 二分找最长能放下的前缀
