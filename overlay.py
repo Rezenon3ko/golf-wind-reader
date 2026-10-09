@@ -316,8 +316,23 @@ class Overlay:
         return text[:lo] + "…"
 
     def quit(self) -> None:
+        """
+        退出。
+
+        Windows 上如果直接在菜单回调里 destroy 窗口，右键菜单那个框有时不会被系统擦掉，
+        就"残影"留在屏幕上（窗口是半透明/置顶的 layered window，更容易出这毛病）。
+        所以：先收起菜单 → 关掉置顶 → 把窗口藏起来（让系统重画那块区域）→
+        等事件队列空一轮之后再真正销毁。
+        """
         self.stop.set()
-        self.root.destroy()
+        try:
+            self.menu.unpost()
+            self.root.attributes("-topmost", False)
+            self.root.withdraw()
+            self.root.update_idletasks()
+        except Exception:
+            pass
+        self.root.after_idle(self.root.destroy)
 
     def run(self) -> None:
         self.root.mainloop()
