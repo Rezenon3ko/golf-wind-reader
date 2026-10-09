@@ -326,13 +326,15 @@ class Overlay:
         """
         self.stop.set()
         try:
-            self.menu.unpost()
+            self.menu.unpost()            # 收起菜单
+            self.menu.destroy()           # 连菜单窗口一起销毁 —— 不销毁它就可能在屏幕上留个"退出"小框
             self.root.attributes("-topmost", False)
             self.root.withdraw()
             self.root.update_idletasks()
         except Exception:
             pass
-        self.root.after_idle(self.root.destroy)
+        # 再等 120ms（Windows 的菜单淡出动画要一会儿），然后真正销毁
+        self.root.after(120, self.root.destroy)
 
     def run(self) -> None:
         self.root.mainloop()
