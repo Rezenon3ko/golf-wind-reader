@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from types import SimpleNamespace
 
 # 打包成无控制台程序时 stdout/stderr 是 None，print 会报错 —— 兜一下
@@ -173,21 +174,25 @@ class Overlay:
         except Exception:
             pass
         self.root.configure(bg=BG)
+        # Tk 的字号单位是「点」：24pt 在屏幕上约等于 32px，
+        # 所以截断提示文案必须按真实宽度量（font.measure），靠估算会算少 1/3。
+        fam, size, weight = ui_font(HEAD_SIZE)
+        self.font = tkfont.Font(family=fam, size=size, weight=weight)
 
         # 第一行：风向箭头 + 风速（按档位着色）+ 夹角，整行水平居中
         head = tk.Frame(self.root, bg=BG)
         head.pack(padx=PAD, pady=(6, 0))
-        self.l_wind = tk.Label(head, text="·  --", font=ui_font(HEAD_SIZE), bg=BG, fg=FG)
+        self.l_wind = tk.Label(head, text="·  --", font=self.font, bg=BG, fg=FG)
         self.l_wind.pack(side="left")
-        self.l_ang = tk.Label(head, text="", font=ui_font(HEAD_SIZE), bg=BG, fg=FG)
+        self.l_ang = tk.Label(head, text="", font=self.font, bg=BG, fg=FG)
         self.l_ang.pack(side="left", padx=(GAP, 0))
 
         # 第二行：横向 + 纵向，排法和第一行一样 —— 两项并排 + 同间距，整组居中
         row = tk.Frame(self.root, bg=BG)
         row.pack(padx=PAD, pady=(0, 8))
-        self.l_lat = tk.Label(row, text="", font=ui_font(HEAD_SIZE), bg=BG, fg=DIM)
+        self.l_lat = tk.Label(row, text="", font=self.font, bg=BG, fg=DIM)
         self.l_lat.pack(side="left")
-        self.l_lon = tk.Label(row, text="", font=ui_font(HEAD_SIZE), bg=BG, fg=DIM)
+        self.l_lon = tk.Label(row, text="", font=self.font, bg=BG, fg=DIM)
         self.l_lon.pack(side="left", padx=(GAP, 0))
 
         # 宽度以第一行为准（第一行居中，左右各留 PAD）；高度取两行的自然高度。
@@ -297,14 +302,18 @@ class Overlay:
         self.l_lon.config(text="")
 
     def _fit(self, text: str) -> str:
-        """按像素宽度估算法截断提示（中文 1.05em、西文 0.6em），避免顶出窗口。"""
-        used, out = 0.0, []
-        for ch in text:
-            used += HEAD_SIZE * (1.05 if ord(ch) > 0x2E80 else 0.6)
-            if used > self.text_px:
-                return "".join(out) + "…"
-            out.append(ch)
-        return text
+        """用真实字体宽度截断提示（Tk 字号单位是点，估算必偏小、会顶出窗口）。"""
+        limit, font = self.text_px, self.font
+        if font.measure(text) <= limit:
+            return text
+        lo, hi = 0, len(text)                      # 二分找最长能放下的前缀
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font.measure(text[:mid] + "…") <= limit:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo] + "…"
 
     def quit(self) -> None:
         self.stop.set()
