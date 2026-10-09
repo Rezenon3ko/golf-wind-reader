@@ -1,0 +1,31 @@
+name: 打包 Windows exe
+
+# 推代码就自动打包；也可以在 Actions 页面手动点 "Run workflow"
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # windows-latest = x64 的 Windows Server，PyInstaller 出来的就是 x64 exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: "x64"
+
+      - name: 安装依赖
+        run: pip install --upgrade pip pyinstaller numpy Pillow obsws-python
+
+      - name: 打包
+        run: pyinstaller --noconfirm --clean packaging/exe.spec
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: NSSR风向识别-exe
+          path: dist/NSSR风向识别.exe
+          if-no-files-found: error

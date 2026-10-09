@@ -1,0 +1,12 @@
+# 打包 / 构建产物（不提交，占几十上百 MB）
+build/
+dist/
+.venv-build/
+.venv-build-win/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
