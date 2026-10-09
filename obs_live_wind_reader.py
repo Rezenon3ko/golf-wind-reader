@@ -35,6 +35,7 @@ import wind_reader as W
 FPS = 2.0                          # 识别频率（次/秒）；越高越跟手、CPU 线性增加（每帧约 70ms）
 QUALITY = 100                      # OBS 抓图 JPEG 质量 —— 固定 100（实测 80→100 少 3/4 的偶发反向）
 OBS_HOST = "127.0.0.1"             # OBS WebSocket 地址（端口/密码读 OBS 自己的配置）
+REQ_TIMEOUT = 2                    # 单次请求超时（秒）；别设大，请求卡住时要尽快失败好重连
 WIDTH, HEIGHT = 1920, 1080         # 抓图分辨率（相对先验定位 / 固定 2× 超采样都按这个标定）
 
 # 采集卡类输入源的 inputKind（OBS 的类型标识，与界面语言无关）
@@ -133,7 +134,8 @@ class ObsWebSocketSource:
             raise RuntimeError(
                 "websocket 取帧需要 obsws-python：pip install obsws-python") from exc
         try:
-            self.cli = obs.ReqClient(host=self.host, port=port, password=password, timeout=5)
+            self.cli = obs.ReqClient(host=self.host, port=port, password=password,
+                                     timeout=REQ_TIMEOUT)
         except Exception as exc:
             raise RuntimeError(f"连不上 OBS WebSocket（{self.host}:{port}）：{exc}") from exc
         inputs = self._inputs()

@@ -81,9 +81,10 @@ SAMPLES = (("↘  15 m/s", "+179.9°", "→ 13.55", "↑ 13.55"),   # 正常结�
 # 后台线程：取帧 → 识别 → 丢进队列
 # --------------------------------------------------------------------------
 class Reader(threading.Thread):
-    def __init__(self, out: queue.Queue, stop: threading.Event):
+    def __init__(self, out: queue.Queue, stop: threading.Event, verbose: bool = False):
         super().__init__(daemon=True)
         self.out, self.stop = out, stop
+        self.verbose = verbose
 
     def run(self) -> None:
         src = rec = None
@@ -99,6 +100,7 @@ class Reader(threading.Thread):
                     continue
             t0 = time.time()
             rgb = src.read()
+            t_read = time.time() - t0
             if rgb is None:
                 self.out.put({"kind": "status", "text": src.status_message()})
                 if src.dead:                      # 连续失败：丢掉连接，下轮重连（顺便重新挑源）
@@ -106,17 +108,32 @@ class Reader(threading.Thread):
                 self.stop.wait(0.3)
                 continue
             try:
+                t1 = time.time()
                 st = rec.recognize(rgb)
+                t_rec = time.time() - t1
             except Exception as exc:
                 self.out.put({"kind": "error", "text": f"识别出错：{exc}"})
                 src = None                        # 丢掉连接，下轮重连
                 self.stop.wait(1.0)
                 continue
+            if self.verbose:                      # 诊断：每帧耗时写日志，定位"慢在哪一段"
+                self._log(f"取帧 {t_read*1000:.0f}ms | 识别 {t_rec*1000:.0f}ms | "
+                          f"风速 {st.get('speed')} θ={st.get('theta') and round(st['theta'], 1)}")
             st["kind"] = "result"
             self.out.put(st)
             rest = 1.0 / O.FPS - (time.time() - t0)     # 固定 1 次/秒
             if rest > 0:
                 self.stop.wait(rest)
+
+    @staticmethod
+    def _log(line: str) -> None:
+        """诊断日志写到用户目录，方便把内容发回来（--verbose 才写）。"""
+        try:
+            path = os.path.join(os.path.expanduser("~"), "nssr-overlay.log")
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(f"{time.strftime('%H:%M:%S')}  {line}\n")
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -186,7 +203,7 @@ class Overlay:
             w.bind("<Button-2>", self._popup)
 
         self._place()
-        Reader(self.q, self.stop).start()
+        Reader(self.q, self.stop, verbose=getattr(args, "verbose", False)).start()
         self.root.after(80, self._poll)
 
     # ---- 窗口位置 ----
@@ -285,6 +302,8 @@ class Overlay:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="NSS 高尔夫风向 —— 桌面悬浮窗")
     p.add_argument("--alpha", type=float, default=0.5, help="窗口不透明度 0~1，默认 0.5")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="诊断：把每帧「取帧/识别」耗时写进 ~/nssr-overlay.log")
     return p
 
 
