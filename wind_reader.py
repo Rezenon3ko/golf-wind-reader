@@ -240,11 +240,19 @@ def fit_ellipse_axis_aligned(pts: np.ndarray, iters: int = 6) -> dict | None:
 
 
 def _bin_white(crop: Image.Image) -> np.ndarray:
-    """近白掩膜：高亮 + 低饱和（用于切字形，避免把彩色叠加线算进来）。"""
+    """
+    近白掩膜：低饱和 + **相对亮度**阈值（用于切字形）。
+
+    别用固定亮度阈值：风盘那圈面板是半透明的，背景亮（天空）时整块面板都变浅，
+    连背景一起被当成"白"，抗锯齿边缘也被算进笔画 → 字被撑粗一圈，字形匹配从 0.94
+    掉到 0.73，于是"偶尔读不出风速"。这里按本块的中位亮度做参照：只取明显更亮的部分。
+    """
     a = np.asarray(crop.convert("RGB")).astype(np.int16)
     mx = a.max(axis=2); mn = a.min(axis=2)
     sat = (mx - mn) / np.maximum(mx, 1)
-    return (mx > 140) & (sat < 0.40)
+    bg, hi = float(np.median(mx)), float(mx.max())
+    thr = max(bg + 0.35 * (hi - bg), bg + 25.0)
+    return (mx > thr) & (sat < 0.40)
 
 
 def arrow_mask(hsv: np.ndarray) -> np.ndarray:
@@ -1071,8 +1079,8 @@ def ocr_speed(rgb: np.ndarray, dial: Dial, state: OcrState | None = None) -> dic
         if tm is None:
             continue
         val = int(tm[0])
-        # match_glyphs 已保证每字形 ≥0.72 且有区分度；这里只要一个绝对下限
-        if 0 <= val <= 60 and tm[1] >= 0.80:
+        # match_glyphs 已保证每字形 ≥0.72 且与次高有 0.05 区分度，这里只兜一个绝对下限
+        if 0 <= val <= 60 and tm[1] >= 0.75:
             res.update(value=val, raw=f"tpl:{tm[0]}", conf=tm[1], ok=True)
             return res
     return res
@@ -1129,43 +1137,68 @@ def glyph_bank_digits(state: OcrState | None = None) -> str:
     return "".join(sorted((state or _DEFAULT_OCR).bank))
 
 
-def _segment_glyphs(crop: Image.Image) -> list[Image.Image]:
-    """把文字行按列投影切成单字形（只取数字部分，遇到宽的 'm' 就停）。"""
-    return [crop.crop((x0, 0, x1, crop.height))
-            for x0, x1, _ in _digit_runs(crop, height_ratio=0.55, max_digits=2)]
+def _glyph_windows(crop: Image.Image, max_digits: int = 2) -> list[list[tuple[int, int]]]:
+    """
+    列出"可能是数字"的列区间组合，供上层逐个试。
+
+    原来只从最左边开始取、遇到宽块（m）就 break —— 数字框里一旦混进别的白块
+    （圆环残影、面板高光），第一个块就是杂块，直接 break 掉一个数字都拿不到，
+    表现就是"风速识别不出"（识别耗时只有几毫秒）。这里改成：先按高度/宽度筛出
+    像字形的窄块，再枚举"任意起点 + 1~2 个连续块"的组合，2 位优先、从左到右。
+    """
+    m = _bin_white(crop)
+    if m.sum() < 20:
+        return []
+    runs = _column_runs(m)
+    if not runs:
+        return []
+    heights = [int(m[:, a:b].any(axis=1).sum()) for a, b in runs]
+    hmax = max(heights)
+    if hmax == 0:
+        return []
+    keep = [(a, b) for (a, b), h in zip(runs, heights)
+            if h >= 0.45 * hmax and (b - a) <= 1.15 * max(h, 1)]
+    out: list[list[tuple[int, int]]] = []
+    for n in range(min(max_digits, 2), 0, -1):        # 先试 2 位，再试 1 位
+        for i in range(len(keep) - n + 1):
+            out.append(keep[i:i + n])
+    return out
 
 
 def match_glyphs(crop: Image.Image,
                  state: OcrState | None = None) -> tuple[str, float] | None:
     """
     用模板库识别数字部分。返回 (数字串, 置信度)；库为空或匹配太弱返回 None。
+
+    逐个尝试候选列区间组合，**第一个全部字形都匹配上的**就是答案（2 位优先于 1 位，
+    这样 "13m/s" 会给出 13 而不是 1）。
     """
     bank = (state or _DEFAULT_OCR).bank
     if not bank:
         return None
-    subs = _segment_glyphs(crop)
-    if not subs:
-        return None
-    out, worst = "", 1.0
-    for sub in subs:
-        g = _glyph_norm(sub)
-        if g is None:
-            return None
-        best = (0.0, "")
-        second = 0.0
-        for digit, temps in bank.items():
-            for t in temps:
-                sc = _glyph_sim(g, t)
-                if sc > best[0]:
-                    second = max(second, best[0])
-                    best = (sc, digit)
-                else:
-                    second = max(second, sc)
-        if best[0] < 0.72 or (best[0] - second) < 0.05:
-            return None                    # 不够有把握，交给别的办法
-        worst = min(worst, best[0])
-        out += best[1]
-    return out, worst
+    for win in _glyph_windows(crop):
+        out, worst = "", 1.0
+        for a, b in win:
+            g = _glyph_norm(crop.crop((a, 0, b, crop.height)))
+            if g is None:
+                break
+            best, second = 0.0, 0.0
+            digit = ""
+            for d, temps in bank.items():
+                for t in temps:
+                    sc = _glyph_sim(g, t)
+                    if sc > best:
+                        second = max(second, best)
+                        best, digit = sc, d
+                    else:
+                        second = max(second, sc)
+            if best < 0.72 or (best - second) < 0.05:
+                break                       # 这个字形不像数字（m / s / 杂块）→ 换下一组
+            out += digit
+            worst = min(worst, best)
+        else:
+            return out, worst               # 整组都匹配上才算数
+    return None
 
 
 # --------------------------------------------------------------------------

@@ -24,6 +24,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from PIL import Image
 from types import SimpleNamespace
 
 # 打包成无控制台程序时 stdout/stderr 是 None，print 会报错 —— 兜一下
@@ -66,8 +67,9 @@ def wind_arrow(theta: float) -> str:
     return ARROWS8[int((theta % 360.0) / 45.0 + 0.5) % 8]
 
 
-HOLD_SEC = 2.5        # 没识别出来时，最多按住上一帧多少秒；超过才把提示刷到窗口
-                      # （按时间算而不是按帧数：慢机器上一帧要 2~3 秒，按帧数会"卡"很久）
+HOLD_BAD = 3          # 连续这么多帧没识别出来…
+HOLD_SEC = 2.5        # …且距上次成功超过这么多秒，才把提示刷到窗口。
+                      # 两个条件都要满足：单帧失败一律按住（慢机器一帧 2~3 秒，只看时间会一失败就弹提示）
 
 
 def ui_font(size: int, bold: bool = True):
@@ -92,6 +94,7 @@ class Reader(threading.Thread):
         self.verbose = verbose
         self.have_good = False       # 是否出过至少一次好结果
         self.last_ok = 0.0           # 上一次识别成功的时间
+        self.bad = 0                 # 连续没识别出来的帧数（要和 last_ok 一起判断才提示）
 
     def run(self) -> None:
         src = rec = None
@@ -106,47 +109,77 @@ class Reader(threading.Thread):
                     self.stop.wait(3.0)           # 3 秒后重试（先开悬浮窗、后开 OBS 也行）
                     continue
             t0 = time.time()
-            rgb = src.read()
-            t_read = time.time() - t0
-            if rgb is None:
-                self.out.put({"kind": "status", "text": src.status_message()})
-                if src.dead:                      # 连续失败：丢掉连接，下轮重连（顺便重新挑源）
-                    src = None
-                self.stop.wait(0.3)
-                continue
             try:
-                t1 = time.time()
-                st = rec.recognize(rgb)
-                t_rec = time.time() - t1
-            except Exception as exc:
-                self.out.put({"kind": "error", "text": f"识别出错：{exc}"})
-                src = None                        # 丢掉连接，下轮重连
+                alive = self._one_frame(src, rec, t0)
+            except Exception as exc:              # 兜底：任何意外都不能让取帧线程死掉（窗口会冻住）
+                self.out.put({"kind": "error", "text": f"识别线程异常：{exc}"})
                 self.stop.wait(1.0)
-                continue
-            if self.verbose:                      # 诊断：每帧耗时写日志，定位"慢在哪一段"
-                tq, td = getattr(src, "last_timing", (0.0, 0.0))
-                d = st.get("dial")
-                where = f"风盘({d.cx:.0f},{d.cy:.0f}) r={d.r:.0f}" if d else "没定位到风盘"
-                ocr = st.get("ocr") or {}
-                if ocr.get("box"):
-                    where += f" 数字框{ocr['box']}" + (f" 放宽{ocr.get('widen')}" if ocr.get("widen") else "")
-                self._log(f"取帧 {t_read*1000:.0f}ms（请求 {tq*1000:.0f} / 解码 {td*1000:.0f}）"
-                          f" | 识别 {t_rec*1000:.0f}ms | 风速 {st.get('speed')} "
-                          f"θ={st.get('theta') and round(st['theta'], 1)} | {where}")
-            # 偶发单帧没识别出来（转身/遮挡/动画中）先按住上一帧，窗口保持上一次的结果；
-            # 超过 HOLD_SEC 秒都没成功才把原因显示出来。还没出过好结果时（刚启动、没在瞄准界面）立刻显示。
-            if st.get("ok"):
-                self.have_good, self.last_ok = True, time.time()
-            elif self.have_good and time.time() - self.last_ok < HOLD_SEC:
-                rest = 1.0 / O.FPS - (time.time() - t0)
-                if rest > 0:
-                    self.stop.wait(rest)
-                continue
-            st["kind"] = "result"
-            self.out.put(st)
-            rest = 1.0 / O.FPS - (time.time() - t0)     # 固定 1 次/秒
+                alive = True
+            if alive is False:                    # 连接/源已判死 → 丢掉，下轮重连（顺便重新挑源）
+                src = None
+            rest = 1.0 / O.FPS - (time.time() - t0)
             if rest > 0:
                 self.stop.wait(rest)
+
+    def _one_frame(self, src, rec, t0: float) -> bool:
+        """跑一帧：取帧 → 识别 → 决定要不要把结果丢给窗口。返回 False 表示该重连。"""
+        rgb = src.read()
+        t_read = time.time() - t0
+        if rgb is None:
+            self.out.put({"kind": "status", "text": src.status_message()})
+            return not src.dead                   # 连续取帧失败 → 交给调用方重连
+        try:
+            t1 = time.time()
+            st = rec.recognize(rgb)
+            t_rec = time.time() - t1
+        except Exception as exc:
+            self.out.put({"kind": "error", "text": f"识别出错：{exc}"})
+            return False                          # 丢掉连接，下轮重连
+        if self.verbose:                          # 诊断：每帧耗时写日志，定位"慢在哪一段"
+            tq, td = getattr(src, "last_timing", (0.0, 0.0))
+            d = st.get("dial")
+            where = f"风盘({d.cx:.0f},{d.cy:.0f}) r={d.r:.0f}" if d else "没定位到风盘"
+            ocr = st.get("ocr") or {}
+            if ocr.get("box"):
+                where += f" 数字框{ocr['box']}"
+            self._log(f"取帧 {t_read*1000:.0f}ms（请求 {tq*1000:.0f} / 解码 {td*1000:.0f}）"
+                      f" | 识别 {t_rec*1000:.0f}ms | 风速 {st.get('speed')} "
+                      f"θ={st.get('theta') and round(st['theta'], 1)} | {where}")
+        if self.verbose and st.get("speed") is None:
+            self._dump(rgb, st)                   # 诊断：把读不出风速的帧存下来（最多 3 张）
+        if st.get("ok"):
+            self.have_good, self.last_ok, self.bad = True, time.time(), 0
+        else:
+            self.bad += 1
+            # 单帧失败一律按住：要"连续 ≥HOLD_BAD 帧"且"距上次成功 ≥HOLD_SEC 秒"才把提示刷上窗口
+            # （慢机器一帧 2~3 秒，只看时间会一失败就弹"未识别"）
+            if self.have_good and (self.bad < HOLD_BAD
+                                   or time.time() - self.last_ok < HOLD_SEC):
+                return True
+        st["kind"] = "result"
+        self.out.put(st)
+        return True
+
+    _DUMPS = 0
+
+    def _dump(self, rgb, st: dict) -> None:
+        """诊断（-v）：把"读不出风速"的那一帧和数字框存成 PNG，最多 3 张，方便离线定位。"""
+        if Reader._DUMPS >= 3:
+            return
+        Reader._DUMPS += 1
+        try:
+            home = os.path.expanduser("~")
+            p = os.path.join(home, f"nssr-fail-{Reader._DUMPS}.png")
+            Image.fromarray(rgb).save(p)
+            box = (st.get("ocr") or {}).get("box")
+            if box:
+                x0, y0, x1, y1 = box
+                Image.fromarray(rgb[y0:y1, x0:x1]).resize(
+                    ((x1 - x0) * 4, (y1 - y0) * 4), Image.NEAREST).save(
+                    os.path.join(home, f"nssr-fail-{Reader._DUMPS}-box.png"))
+            self._log(f"已存诊断图 {p}（数字框 {box}）")
+        except Exception:
+            pass
 
     @staticmethod
     def _log(line: str) -> None:
@@ -288,6 +321,7 @@ class Overlay:
             self.ok = True
             self._resize(self.win_w)          # 回到固定宽度
             self.l_ang.pack_configure(padx=(GAP, 0))
+            self.l_lon.pack_configure(padx=(GAP, 0))
             w = st["wind"]
             # 大行：风向箭头 + 总风速 + 夹角（夹角中性色）
             # 小行：横向 / 纵向分量
@@ -297,26 +331,35 @@ class Overlay:
             self.l_wind.config(text=f"{wind_arrow(w['theta_deg'])}  {w['speed']:g} m/s", fg=col)
             self.l_ang.config(text=f"{ang:+.1f}°")
             # 第二行沿用第一行的排法：箭头 + 两个空格 + 数值
+            # 颜色各自按**自己的数值**取档位（横向 7 → 黄、纵向 12 → 品红），不是跟着总风速
             self.l_lat.config(text=f"{LAT_ARROW.get(w['lateral_dir'], '·')}  {w['lateral_abs']:.2f}",
-                              fg=col)
+                              fg=speed_color(w["lateral_abs"]))
             self.l_lon.config(text=f"{LON_ARROW.get(w['longitudinal_dir'], '·')}  {w['longitudinal_abs']:.2f}",
-                              fg=col)
+                              fg=speed_color(w["longitudinal_abs"]))
 
     def _line1(self, text: str, color: str) -> None:
         """
-        整句提示写进第一行。窗口会临时加宽到**刚好放下这句话**（上限屏幕 90%），
-        这样左右留白自然相等、也不会被截断成"贴着左边"的样子；正常显示时再缩回固定宽度。
+        提示写进窗口，**窗口尺寸不变**：一行放得下就放第一行；放不下就在靠中间的自然位置
+        （「（」「：」「，」…）拆成两行，第二行借用下面那行的位置，两行各自居中。
         """
+        line1, line2 = self._split(text)
+        self.l_wind.config(text=self._fit(line1), fg=color)
         self.l_ang.config(text="")
-        self.l_lat.config(text="")
+        self.l_ang.pack_configure(padx=0)                 # 夹角为空时不占位，才会真正居中
+        self.l_lat.config(text=self._fit(line2), fg=color)
         self.l_lon.config(text="")
-        self.l_ang.pack_configure(padx=0)      # 夹角为空时不占位，提示才是真正左右居中
-        cap = int(self.root.winfo_screenwidth() * 0.90) - 2 * PAD - 8
-        shown = self._fit(text, cap)                  # 只有超过屏幕宽度时才截断
-        self.l_wind.config(text=shown, fg=color)
-        self.root.update_idletasks()
-        need = self.head.winfo_reqwidth() + 2 * PAD + 16   # 留 8px 左右边距，居中才看得出来
-        self._resize(max(self.win_w, need))
+        self.l_lat.pack_configure(padx=0)
+        self.l_lon.pack_configure(padx=0)
+
+    def _split(self, text: str) -> tuple[str, str]:
+        """一行放不下就拆两行：优先在句子中间的自然分隔符处断。"""
+        if self.font.measure(text) <= self.text_px:
+            return text, ""
+        mid = len(text) // 2
+        for i, ch in enumerate(text):
+            if ch in "（(：:，,、；; " and abs(i - mid) <= 8:
+                return text[:i], text[i:]
+        return text[:mid], text[mid:]
 
     def _resize(self, w: int) -> None:
         """改窗口宽度：贴住原来的右边缘（不跑出屏幕），高度不变。"""
