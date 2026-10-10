@@ -1092,8 +1092,8 @@ def ocr_speed(rgb: np.ndarray, dial: Dial, state: OcrState | None = None) -> dic
                 res["reject"] = dict(value=int(bad[0]), conf=float(bad[1]), box=res["box"])
             continue
         val = int(tm[0])
-        # match_glyphs 已保证每字形 ≥0.72 且与次高有 0.05 区分度，这里只兜一个绝对下限
-        if 0 <= val <= MAX_WIND and tm[1] >= 0.75:
+        # match_glyphs 已保证"绝对分 ≥0.60 且与次高差 ≥0.10"，这里只兜游戏范围的上下限
+        if 0 <= val <= MAX_WIND and tm[1] >= 0.60:
             res.update(value=val, raw=f"tpl:{tm[0]}", conf=tm[1], ok=True)
             return res
     return res
@@ -1150,14 +1150,58 @@ def glyph_bank_digits(state: OcrState | None = None) -> str:
     return "".join(sorted((state or _DEFAULT_OCR).bank))
 
 
-def _glyph_windows(crop: Image.Image, max_digits: int = 2) -> list[list[tuple[int, int]]]:
+def _split_wide_runs(mask: np.ndarray, runs: list[tuple[int, int]],
+                     kth: int = 0) -> list[tuple[int, int]]:
+    """
+    把"过宽的列块"从第 kth 细的腰处拆开（kth=0 就是最细的那一列）。
+
+    "1" 紧挨着 "m" 时会被并成一整块：这块的高度按高的那个（数字）算、宽高比超标，
+    于是数字整个从候选里消失，只剩 "/" 和 "s" —— 表现就是 1m/s 读成 5。
+    粘连处通常只有几个抗锯齿像素，是块内墨迹最少的列，从那儿下刀基本能分开。
+    但"最细的列"未必正好是接缝（m 的竖笔之间也可能更细），所以调用方会多切几个位置，
+    切错了没关系 —— 切出来的块不像数字，匹配那关自然会被刷掉。
+    """
+    out: list[tuple[int, int]] = []
+    for a, b in runs:
+        w = b - a
+        if w < 12:                                   # 窄块本来就是一个字形，不动
+            out.append((a, b))
+            continue
+        col = mask[:, a:b].sum(axis=0)
+        lo, hi = max(1, int(0.15 * w)), min(w - 1, int(0.85 * w))
+        if hi <= lo:
+            out.append((a, b))
+            continue
+        order = sorted(range(lo, hi), key=lambda i: int(col[i]))
+        k = order[min(kth, len(order) - 1)]
+        out.append((a, a + k))
+        out.append((a + k, b))
+    return out
+
+
+def _run_variants(mask: np.ndarray, runs: list[tuple[int, int]],
+                  cuts: int = 3) -> list[list[tuple[int, int]]]:
+    """列块变体：原样一份，再加上"在几个不同的细腰处下刀"的若干份。"""
+    out = [runs]
+    for k in range(cuts):
+        v = _split_wide_runs(mask, runs, kth=k)
+        if v != runs and v not in out:
+            out.append(v)
+    return out
+
+
+def _glyph_windows(crop: Image.Image, max_digits: int = 2,
+                   two_start: int = 3, one_start: int = 2
+                   ) -> list[list[tuple[int, int]]]:
     """
     列出"可能是数字"的列区间组合，供上层逐个试。
 
-    原来只从最左边开始取、遇到宽块（m）就 break —— 数字框里一旦混进别的白块
-    （圆环残影、面板高光），第一个块就是杂块，直接 break 掉一个数字都拿不到，
-    表现就是"风速识别不出"（识别耗时只有几毫秒）。这里改成：先按高度/宽度筛出
-    像字形的窄块，再枚举"任意起点 + 1~2 个连续块"的组合，2 位优先、从左到右。
+    风速数字**永远在 "m/s" 前面**，所以只在最左边几个列块里找（留点余量给混进
+    数字框的杂块）。这条约束把 "m"、"/"、"s" 排除在候选之外 —— 之前是"任意起点"
+    全枚举，"s" 会被认成 5：于是 1m/s 读成 5、3m/s 读成 35。
+    （1 位数只在前 one_start 个块里找：粘连时 "s" 会顶到前面来，得卡死。）
+
+    另外再补一份"把过宽粘连块拆开"的列块（见 _split_wide_runs）作为第二组候选。
     """
     m = _bin_white(crop)
     if m.sum() < 20:
@@ -1165,16 +1209,14 @@ def _glyph_windows(crop: Image.Image, max_digits: int = 2) -> list[list[tuple[in
     runs = _column_runs(m)
     if not runs:
         return []
-    heights = [int(m[:, a:b].any(axis=1).sum()) for a, b in runs]
-    hmax = max(heights)
-    if hmax == 0:
-        return []
-    keep = [(a, b) for (a, b), h in zip(runs, heights)
-            if h >= 0.45 * hmax and (b - a) <= 1.15 * max(h, 1)]
     out: list[list[tuple[int, int]]] = []
-    for n in range(min(max_digits, 2), 0, -1):        # 先试 2 位，再试 1 位
-        for i in range(len(keep) - n + 1):
-            out.append(keep[i:i + n])
+    for rs in _run_variants(m, runs):
+        for n, start_cap in ((min(max_digits, 2), two_start), (1, one_start)):
+            head = rs[:start_cap]
+            for i in range(max(0, len(head) - n + 1)):
+                win = list(head[i:i + n])
+                if len(win) == n and win not in out:
+                    out.append(win)
     return out
 
 
@@ -1209,7 +1251,12 @@ def match_glyphs(crop: Image.Image,
                         best, digit = sc, d
                     else:
                         second = max(second, sc)
-            if best < 0.72 or (best - second) < 0.05:
+            # 判据是"差距"，不是绝对分：
+            #   "1" 这种细笔画的字，绝对相似度天生上不去（归一化后差几个像素，IoU 掉一大截，
+            #   实测干净切出来的 "1" 也只有 0.66），但它跟第二名的差距极大（0.66 vs 0.45）。
+            #   反过来 "/"、"s" 这些杂块是"谁都不像"：最高 0.70、第二名 0.69，差距只有 0.01。
+            #   所以：绝对分兜个底 + 差距要求大，两个都要满足。
+            if best < 0.60 or (best - second) < 0.10:
                 break                       # 这个字形不像数字（m / s / 杂块）→ 换下一组
             out += digit
             worst = min(worst, best)
