@@ -10,3 +10,7 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# 运行时产生的日志 / 诊断图（就在程序旁边）
+nssr-overlay.log*
+nssr-fail-*.png

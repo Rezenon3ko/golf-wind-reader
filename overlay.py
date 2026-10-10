@@ -6,10 +6,10 @@ NSS 高尔夫风向 —— 桌面悬浮窗（Tkinter）
 用一个置顶的小窗口显示识别结果，不用盯着命令行。
 
     python3 overlay.py                    # 固定每秒识别 1 次
-    python3 overlay.py --obs-source "视频采集设备"
     python3 overlay.py --alpha 0.5        # 更透明（默认 0.5）
 
 操作：**拖动窗口**移动；**右键 → 退出**。
+日志和诊断图就在程序所在文件夹（exe / .app 旁边）：nssr-overlay.log、nssr-fail-*.png。
 
 依赖和命令行版一样（numpy / Pillow / obsws-python），另加 Tkinter（Python 自带）。
 """
@@ -52,6 +52,48 @@ def _safe_stdio() -> None:
 
 
 _safe_stdio()
+
+
+def _program_dir() -> str:
+    """
+    程序所在文件夹 —— 日志和诊断图就放这儿，玩家最容易找（就在 exe / .app 旁边）。
+
+    打包后 sys.executable 是 exe 本体；macOS 的 .app 里它是
+    xxx.app/Contents/MacOS/xxx，得往上找到 .app 再取它**所在**的文件夹
+    （往 .app 里面写会破坏签名，也可能没权限）。源码运行时就是本文件所在目录。
+    """
+    if getattr(sys, "frozen", False):
+        exe = os.path.abspath(sys.executable)
+        head = os.path.dirname(exe)
+        while head and head != os.path.dirname(head):
+            if head.endswith(".app"):
+                return os.path.dirname(head)
+            head = os.path.dirname(head)
+        return os.path.dirname(exe)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+_ART_DIR: str | None = None
+
+
+def _artifact_dir() -> str:
+    """
+    存日志/诊断图的目录：优先程序所在文件夹；不可写（Program Files、只读盘…）
+    就退回用户主目录 —— 宁可变位置，也不能因为写不进去而丢掉日志。
+    """
+    global _ART_DIR
+    if _ART_DIR is None:
+        d = _program_dir()
+        try:
+            probe = os.path.join(d, ".nssr-write-test")
+            with open(probe, "w") as fh:
+                fh.write("")
+            os.remove(probe)
+            _ART_DIR = d
+        except Exception:
+            _ART_DIR = os.path.expanduser("~")
+    return _ART_DIR
+
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import obs_live_wind_reader as O          # 复用取帧（ObsWebSocketSource）与识别（Recognizer）
@@ -110,19 +152,19 @@ SAMPLES = (("↘  15 m/s", "+179.9°", "→ 13.55", "↑ 13.55"),   # 正常结�
 # 后台线程：取帧 → 识别 → 丢进队列
 # --------------------------------------------------------------------------
 class Reader(threading.Thread):
-    def __init__(self, out: queue.Queue, stop: threading.Event, verbose: bool = False):
+    def __init__(self, out: queue.Queue, stop: threading.Event):
         super().__init__(daemon=True)
         self.out, self.stop = out, stop
-        self.verbose = verbose
         self.have_good = False       # 是否出过至少一次好结果
         self.last_ok = 0.0           # 上一次识别成功的时间
         self.bad = 0                 # 连续没识别出来的帧数（要和 last_ok 一起判断才提示）
+        self.next_beat = 0.0         # 下一帧"体检"行写日志的时间（每 10 秒一条，别刷爆日志）
 
     def run(self) -> None:
         src = rec = None
         backoff = 3.0                             # 连不上时的重试间隔（失败就翻倍，最长 30 秒）
         self._log(f"启动：{sys.platform} / Python {sys.version.split()[0]} / "
-                  f"{O.FPS:g} 次每秒 / 日志 {os.path.join(os.path.expanduser('~'), 'nssr-overlay.log')}")
+                  f"{O.FPS:g} 次每秒 / 日志 {os.path.join(_artifact_dir(), 'nssr-overlay.log')}")
         while not self.stop.is_set():
             if src is None:                       # （重）连 OBS + 建识别器
                 if rec is None:                   # 识别器只建一次：它跟 OBS 无关，
@@ -225,7 +267,9 @@ class Reader(threading.Thread):
         except Exception as exc:
             self._report(f"识别出错：{exc}")
             return False                          # 丢掉连接，下轮重连
-        if self.verbose:                          # 诊断：每帧耗时写日志，定位"慢在哪一段"
+        now = time.time()
+        if now >= self.next_beat:                 # 每 10 秒记一条"体检"行：够定位慢在哪一段，又不刷屏
+            self.next_beat = now + 10.0
             tq, td = getattr(src, "last_timing", (0.0, 0.0))
             d = st.get("dial")
             where = f"风盘({d.cx:.0f},{d.cy:.0f}) r={d.r:.0f}" if d else "没定位到风盘"
@@ -240,8 +284,8 @@ class Reader(threading.Thread):
             self._log(f"读数越界已丢弃：读成 {rej['value']} m/s"
                       f"（置信 {rej['conf']:.2f}，框 {rej['box']}）")
             self._dump(rgb, st)
-        elif self.verbose and st.get("speed") is None:
-            self._dump(rgb, st)                   # 诊断：把读不出风速的帧存下来（最多 3 张）
+        elif st.get("speed") is None:
+            self._dump(rgb, st)                   # 读不出风速：存帧（最多 3 张，循环覆盖）
         if st.get("ok"):
             self.have_good, self.last_ok, self.bad = True, time.time(), 0
         else:
@@ -258,20 +302,20 @@ class Reader(threading.Thread):
     _DUMPS = 0
 
     def _dump(self, rgb, st: dict) -> None:
-        """诊断（-v）：把"读不出风速"的那一帧和数字框存成 PNG，最多 3 张，方便离线定位。"""
+        """把"读不出风速"的那一帧和数字框存成 PNG，最多 3 张（循环覆盖），方便离线定位。"""
         if Reader._DUMPS >= 3:
             return
         Reader._DUMPS += 1
         try:
-            home = os.path.expanduser("~")
-            p = os.path.join(home, f"nssr-fail-{Reader._DUMPS}.png")
+            d = _artifact_dir()
+            p = os.path.join(d, f"nssr-fail-{Reader._DUMPS}.png")
             Image.fromarray(rgb).save(p)
             box = (st.get("ocr") or {}).get("box")
             if box:
                 x0, y0, x1, y1 = box
                 Image.fromarray(rgb[y0:y1, x0:x1]).resize(
                     ((x1 - x0) * 4, (y1 - y0) * 4), Image.NEAREST).save(
-                    os.path.join(home, f"nssr-fail-{Reader._DUMPS}-box.png"))
+                    os.path.join(d, f"nssr-fail-{Reader._DUMPS}-box.png"))
             self._log(f"已存诊断图 {p}（数字框 {box}）")
         except Exception:
             pass
@@ -279,13 +323,14 @@ class Reader(threading.Thread):
     @staticmethod
     def _log(line: str) -> None:
         """
-        写诊断日志到用户目录（**总是写**：双击启动没有终端，出问题只能靠这个日志查）。
+        写诊断日志（**总是写**：双击启动没有终端，出问题只能靠这个日志查）。
 
-        每帧的耗时明细仍然只在 --verbose 时写，平时只有启动/连接/报错这几行，文件很小。
+        位置在程序所在文件夹（exe / .app 旁边）；写不进去才退回用户主目录。
+        内容：启动、连接、报错、越界读数，外加每 10 秒一条耗时"体检"行。
         超过 2MB 就滚动一次，别无限长。
         """
         try:
-            path = os.path.join(os.path.expanduser("~"), "nssr-overlay.log")
+            path = os.path.join(_artifact_dir(), "nssr-overlay.log")
             if os.path.exists(path) and os.path.getsize(path) > 2 * 1024 * 1024:
                 os.replace(path, path + ".1")      # 保留上一轮，日志总共最多 ~4MB
             with open(path, "a", encoding="utf-8") as fh:
@@ -370,7 +415,7 @@ class Overlay:
             w.bind("<Button-2>", self._popup)
 
         self._place()
-        Reader(self.q, self.stop, verbose=getattr(args, "verbose", False)).start()
+        Reader(self.q, self.stop).start()
         self.root.after(80, self._poll)
 
     # ---- 窗口位置 ----
@@ -660,8 +705,6 @@ class Overlay:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="NSS 高尔夫风向 —— 桌面悬浮窗")
     p.add_argument("--alpha", type=float, default=0.5, help="窗口不透明度 0~1，默认 0.5")
-    p.add_argument("-v", "--verbose", action="store_true",
-                   help="诊断：每帧「取帧/识别」耗时也写进 ~/nssr-overlay.log（报错本来就写）")
     return p
 
 
