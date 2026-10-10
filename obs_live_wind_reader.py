@@ -33,6 +33,28 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wind_reader as W
 
+
+def _safe_stdio() -> None:
+    """
+    让本文件的 print 永远不因**编码**抛异常（Windows 中文系统 GBK 编不出 ⚠ ✗，
+    英文系统 cp1252 连中文都编不出）。
+
+    这不是纸上谈兵：抛的地方常常正好是"刚连上 OBS、正在打印源名"那一刻，
+    连接被丢在半路、OBS 里留下僵尸会话，程序却报"连不上"。
+    """
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8", errors="replace"))
+            continue
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
+
+_safe_stdio()
+
 FPS = 2.0                          # 识别频率（次/秒）；越高越跟手、CPU 线性增加（每帧约 70ms）
 QUALITY = 100                      # OBS 抓图 JPEG 质量 —— 固定 100（实测 80→100 少 3/4 的偶发反向）
 OBS_HOST = "127.0.0.1"             # OBS WebSocket 地址（端口/密码读 OBS 自己的配置）
@@ -240,14 +262,21 @@ class ObsWebSocketSource:
                         f"换机器就设 NSSR_OBS_HOST=那台的IP）。")
             raise RuntimeError(f"连不上 OBS WebSocket（{self.host}:{port}）：{why}\n"
                                f"  {_probe_port(self.host, port)}{hint}") from exc
-        inputs = self._inputs()
-        self.source = self._pick_source(self.want_source, inputs)
-        kind = next((i["kind"] for i in inputs if i["name"] == self.source), "")
-        self.note = (f"OBS 源「{self.source}」{f'({kind})' if kind else ''} -> "
-                     f"{self.width}×{self.height} {self.fmt.upper()} q={self.quality}"
-                     f"（{self.host}:{port}，{'已带密码' if password else '无密码'}"
-                     f"，配置来自 {cfg_from}）")
-        print(f"[取帧] {self.note}")
+        # 连上之后的挑源/打印，万一再出任何岔子（例如 Windows 上打印源名时编码炸了），
+        # 也要把连接关掉再抛 —— 否则 OBS 里就留一个"已连接"的僵尸会话，
+        # 表现正是"OBS 显示连着、程序却说连不上"。
+        try:
+            inputs = self._inputs()
+            self.source = self._pick_source(self.want_source, inputs)
+            kind = next((i["kind"] for i in inputs if i["name"] == self.source), "")
+            self.note = (f"OBS 源「{self.source}」{f'({kind})' if kind else ''} -> "
+                         f"{self.width}×{self.height} {self.fmt.upper()} q={self.quality}"
+                         f"（{self.host}:{port}，{'已带密码' if password else '无密码'}"
+                         f"，配置来自 {cfg_from}）")
+            print(f"[取帧] {self.note}")
+        except Exception:
+            self.close()
+            raise
         self.fails, self.dead = 0, False
 
     @staticmethod

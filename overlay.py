@@ -27,11 +27,31 @@ import tkinter.font as tkfont
 from PIL import Image
 from types import SimpleNamespace
 
-# 打包成无控制台程序时 stdout/stderr 是 None，print 会报错 —— 兜一下
-if sys.stdout is None:
-    sys.stdout = open(os.devnull, "w")
-if sys.stderr is None:
-    sys.stderr = open(os.devnull, "w")
+
+def _safe_stdio() -> None:
+    """
+    让 print 永远不因**编码**抛异常。
+
+    Windows 上 stdout 用的是本地代码页（中文系统 GBK、英文系统 cp1252），
+    编不出的字符（中文、⚠、✗…）会直接抛 UnicodeEncodeError。打包成无控制台程序后
+    stdout 被接到 devnull，同样按本地代码页编码 —— 一样会抛。
+
+    这个坑很阴：抛的地方常常正好是"刚连上 OBS、正在打印源名"那一刻，
+    于是连接被丢在半路、OBS 里留下僵尸会话，程序却报"连不上"。
+    所以这里先把 stdout/stderr 变成"编不出就替换成 ?"的宽松模式。
+    """
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None:                            # 无控制台（打包后的窗口程序）
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8", errors="replace"))
+            continue
+        try:
+            stream.reconfigure(errors="replace")      # 保留原编码，编不出的字符换成 ?，不再抛
+        except Exception:
+            pass
+
+
+_safe_stdio()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import obs_live_wind_reader as O          # 复用取帧（ObsWebSocketSource）与识别（Recognizer）
