@@ -9,7 +9,8 @@ NSS 高尔夫风向 —— 桌面悬浮窗（Tkinter）
     python3 overlay.py --alpha 0.5        # 更透明（默认 0.5）
 
 操作：**拖动窗口**移动；**右键 → 退出**。
-日志和诊断图就在程序所在文件夹（exe / .app 旁边）：nssr-overlay.log、nssr-fail-*.png。
+日志和诊断图放在程序旁边的「NSSR日志」文件夹里（exe / .app 同级）：
+nssr-overlay.log、nssr-fail-*.jpg。
 
 依赖和命令行版一样（numpy / Pillow / obsws-python），另加 Tkinter（Python 自带）。
 """
@@ -74,25 +75,54 @@ def _program_dir() -> str:
 
 
 _ART_DIR: str | None = None
+LOG_DIR_NAME = "NSSR日志"      # 日志/诊断图放在程序旁边的这个文件夹（不再直接摊在 exe 那层）
 
 
 def _artifact_dir() -> str:
     """
-    存日志/诊断图的目录：优先程序所在文件夹；不可写（Program Files、只读盘…）
-    就退回用户主目录 —— 宁可变位置，也不能因为写不进去而丢掉日志。
+    存日志/诊断图的目录：**程序旁边新建的 NSSR日志 文件夹**（exe / .app 同级，
+    这样 exe 那层不会被日志和截图弄乱）。
+
+    建不出来或写不进去（Program Files、只读盘…）就逐级回退：
+    程序所在文件夹 → 用户主目录 —— 宁可变位置，也不能因为写不进去而丢掉日志。
     """
     global _ART_DIR
     if _ART_DIR is None:
-        d = _program_dir()
-        try:
-            probe = os.path.join(d, ".nssr-write-test")
-            with open(probe, "w") as fh:
-                fh.write("")
-            os.remove(probe)
-            _ART_DIR = d
-        except Exception:
+        base = _program_dir()
+        for d in (os.path.join(base, LOG_DIR_NAME), base, os.path.expanduser("~")):
+            try:
+                os.makedirs(d, exist_ok=True)
+                probe = os.path.join(d, ".nssr-write-test")
+                with open(probe, "w") as fh:
+                    fh.write("")
+                os.remove(probe)
+                _ART_DIR = d
+                break
+            except Exception:
+                continue
+        if _ART_DIR is None:
             _ART_DIR = os.path.expanduser("~")
     return _ART_DIR
+
+
+def _migrate_old_artifacts() -> None:
+    """旧版本把日志/截图直接摊在程序目录里 —— 搬家到 NSSR日志 文件夹（只挪不删）。"""
+    d, base = _artifact_dir(), _program_dir()
+    if d == base:
+        return
+    try:
+        names = os.listdir(base)
+    except Exception:
+        return
+    for n in names:
+        if not (n.startswith("nssr-overlay.log") or n.startswith("nssr-fail-")):
+            continue
+        src, dst = os.path.join(base, n), os.path.join(d, n)
+        try:
+            if not os.path.exists(dst):
+                os.replace(src, dst)
+        except Exception:
+            pass
 
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -170,6 +200,7 @@ class Reader(threading.Thread):
     def run(self) -> None:
         src = rec = None
         backoff = 3.0                             # 连不上时的重试间隔（失败就翻倍，最长 30 秒）
+        _migrate_old_artifacts()                  # 旧版摊在 exe 那层的日志/截图先收进子文件夹
         self._log(f"启动：{sys.platform} / Python {sys.version.split()[0]} / "
                   f"{O.FPS:g} 次每秒 / 日志 {os.path.join(_artifact_dir(), 'nssr-overlay.log')}")
         self._prune_dumps()                       # 旧诊断图超预算先清掉（含旧版本留下的 .png）
