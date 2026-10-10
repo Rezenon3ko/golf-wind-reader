@@ -53,6 +53,11 @@ CONFIG = Config()
 # 实测 ss=1/2/4 的平均误差 0.36°/0.24°/0.17°，再往上只烧 CPU（耗时按 ss² 涨）。
 SUPERSAMPLE = 2
 
+# 游戏里的风速就是 1~15 m/s（三档：1-5 青 / 6-10 黄 / 11-15 品红），0 = 无风。
+# 读出来超过这个数一定是把别的白块当成数字了 —— 例如 "3m/s" 里的字形被凑成 "35"。
+# 这种时候宁可当"没读出来"（下帧再读），也不能把一个错值算成 35 m/s 的风。
+MAX_WIND = 15
+
 
 # --------------------------------------------------------------------------
 # 其余阈值
@@ -1067,20 +1072,28 @@ def _find_text_lines(rgb: np.ndarray, dial: Dial,
 def ocr_speed(rgb: np.ndarray, dial: Dial, state: OcrState | None = None) -> dict:
     """识别风盘附近的 "Nm/s" 数字：切出文字行，用字形模板库匹配。
 
-    返回 dict(value, raw, conf, box, ok)；模板库为空或不够有把握时 value 为 None。
+    返回 dict(value, raw, conf, box, ok)；模板库为空、不够有把握、或读出的数值
+    超出游戏范围（0~MAX_WIND m/s）时 value 为 None。
+
+    reject 字段记着"本来读成了多少"，专供排查：读成 35 m/s 这种明显不可能的，
+    既不算数，也得留下证据（调用方会因此存一帧图）。
     """
     state = state or _DEFAULT_OCR
-    res = dict(value=None, raw="", conf=0.0, box=None, ok=False)
+    res = dict(value=None, raw="", conf=0.0, box=None, ok=False, reject=None)
     # 候选文字行按面积从大到小依次试，第一个匹配上的就是风速
     for roi in _find_text_lines(rgb, dial):
         x0, y0, x1, y1 = roi
         res["box"] = [x0, y0, x1, y1]
-        tm = match_glyphs(Image.fromarray(rgb[y0:y1, x0:x1]), state=state)
+        crop = Image.fromarray(rgb[y0:y1, x0:x1])
+        tm = match_glyphs(crop, state=state, accept=lambda v: 0 <= v <= MAX_WIND)
         if tm is None:
+            bad = match_glyphs(crop, state=state)      # 只是一探：记下"读成了什么"供排查
+            if bad is not None:
+                res["reject"] = dict(value=int(bad[0]), conf=float(bad[1]), box=res["box"])
             continue
         val = int(tm[0])
         # match_glyphs 已保证每字形 ≥0.72 且与次高有 0.05 区分度，这里只兜一个绝对下限
-        if 0 <= val <= 60 and tm[1] >= 0.75:
+        if 0 <= val <= MAX_WIND and tm[1] >= 0.75:
             res.update(value=val, raw=f"tpl:{tm[0]}", conf=tm[1], ok=True)
             return res
     return res
@@ -1166,12 +1179,16 @@ def _glyph_windows(crop: Image.Image, max_digits: int = 2) -> list[list[tuple[in
 
 
 def match_glyphs(crop: Image.Image,
-                 state: OcrState | None = None) -> tuple[str, float] | None:
+                 state: OcrState | None = None,
+                 accept=None) -> tuple[str, float] | None:
     """
     用模板库识别数字部分。返回 (数字串, 置信度)；库为空或匹配太弱返回 None。
 
     逐个尝试候选列区间组合，**第一个全部字形都匹配上的**就是答案（2 位优先于 1 位，
     这样 "13m/s" 会给出 13 而不是 1）。
+
+    accept 是可选的数值校验：不通过就换下一组窗口再试。用来挡掉"3m/s 被凑成 35"
+    这种 —— 2 位数先试，凑出来的值超出游戏范围就直接作废，回头还能认出正确的那一位。
     """
     bank = (state or _DEFAULT_OCR).bank
     if not bank:
@@ -1197,7 +1214,8 @@ def match_glyphs(crop: Image.Image,
             out += digit
             worst = min(worst, best)
         else:
-            return out, worst               # 整组都匹配上才算数
+            if accept is None or accept(int(out)):
+                return out, worst           # 整组都匹配上、数值也合理，才算数
     return None
 
 

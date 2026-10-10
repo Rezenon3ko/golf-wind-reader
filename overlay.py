@@ -235,7 +235,12 @@ class Reader(threading.Thread):
             self._log(f"取帧 {t_read*1000:.0f}ms（请求 {tq*1000:.0f} / 解码 {td*1000:.0f}）"
                       f" | 识别 {t_rec*1000:.0f}ms | 风速 {st.get('speed')} "
                       f"θ={st.get('theta') and round(st['theta'], 1)} | {where}")
-        if self.verbose and st.get("speed") is None:
+        rej = (st.get("ocr") or {}).get("reject")
+        if rej:                                   # 读成 35 m/s 这种不可能的 → 存帧留证并记日志
+            self._log(f"读数越界已丢弃：读成 {rej['value']} m/s"
+                      f"（置信 {rej['conf']:.2f}，框 {rej['box']}）")
+            self._dump(rgb, st)
+        elif self.verbose and st.get("speed") is None:
             self._dump(rgb, st)                   # 诊断：把读不出风速的帧存下来（最多 3 张）
         if st.get("ok"):
             self.have_good, self.last_ok, self.bad = True, time.time(), 0
