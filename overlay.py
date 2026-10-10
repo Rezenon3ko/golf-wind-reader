@@ -79,6 +79,7 @@ def ui_font(size: int, bold: bool = True):
 
 HEAD_SIZE = 24                 # 正常显示的字号（两行统一）
 ERROR_SIZE = HEAD_SIZE - 6     # 提示/报错的字号：小一号，Windows 上 24pt 太大、长句会被切
+ERR_MIN_SIZE = 12              # 提示字号的**下限**：放不下就逐级缩小，缩到这么小为止（再小就难认了）
 GAP = 10                       # 同一行里两项之间的间距（两行共用一个值）
 # 量窗口尺寸用的"最长一行"样本（定死尺寸，文字变长也不会跑出屏幕）
 SAMPLES = (("↘  15 m/s", "+179.9°", "→ 13.55", "↑ 13.55"),   # 正常结果的最宽一拍
@@ -108,7 +109,11 @@ class Reader(threading.Thread):
                     backoff = 3.0                 # 连上了，退避重置
                     self.out.put({"kind": "status", "text": "已连接，等待画面…"})
                 except Exception as exc:
-                    self.out.put({"kind": "error", "text": f"连接 OBS 失败：{exc}"})
+                    full = f"连接 OBS 失败：{exc}"
+                    print("\n" + full)                      # 终端里给完整信息（双击启动时无终端，无妨）
+                    if self.verbose:
+                        self._log(full)
+                    self.out.put({"kind": "error", "text": self._conn_hint(full)})
                     self.stop.wait(backoff)       # 3→6→12→24→30 秒：别一秒一次地往 OBS 灌会话
                     backoff = min(backoff * 2.0, 30.0)
                     continue
@@ -116,7 +121,11 @@ class Reader(threading.Thread):
             try:
                 alive = self._one_frame(src, rec, t0)
             except Exception as exc:              # 兜底：任何意外都不能让取帧线程死掉（窗口会冻住）
-                self.out.put({"kind": "error", "text": f"识别线程异常：{exc}"})
+                msg = f"识别线程异常：{exc}"
+                print("\n" + msg)
+                if self.verbose:
+                    self._log(msg)
+                self.out.put({"kind": "error", "text": self._brief(msg)})
                 self.stop.wait(1.0)
                 alive = True
             if alive is False:                    # 连接/源已判死 → 先关上再丢，下轮重连
@@ -127,6 +136,31 @@ class Reader(threading.Thread):
             rest = 1.0 / O.FPS - (time.time() - t0)
             if rest > 0:
                 self.stop.wait(rest)
+
+    @staticmethod
+    def _conn_hint(full: str) -> str:
+        """
+        窗口只放一句**能照做的动作**，不放那一大段英文报错（报错全文照样打到终端/日志）。
+
+        之前把"端口探针 + 分步清单"整段塞进窗口，300 多字符怎么排版都显示不全。
+        """
+        low = full.lower()
+        if ("password" in low) or ("auth" in low):
+            return "连不上 OBS：请取消勾选「启用身份验证」再试"
+        if ("10061" in full) or ("refused" in low) or ("完全连不上" in full):
+            return "连不上 OBS：确认 OBS 已开、并启用了 WebSocket 服务器"
+        return "连不上 OBS：请确认 OBS 正在运行（详情看终端/日志）"
+
+    @staticmethod
+    def _brief(text: str, limit: int = 60) -> str:
+        """
+        窗口只放得下一行摘要：取第一行、压掉换行和多余空格、太长就截断加「…」。
+
+        原因：库里的报错为了终端排错写得很详细（端口探针 + 分步清单 ≈ 300 字符），
+        直接塞进小窗口怎么排版都不够 —— 详细内容走终端/日志，窗口只留最关键那句。
+        """
+        one = " ".join(str(text).split())
+        return one if len(one) <= limit else one[:limit] + "…"
 
     @staticmethod
     def _drop(src) -> None:
@@ -146,14 +180,17 @@ class Reader(threading.Thread):
         rgb = src.read()
         t_read = time.time() - t0
         if rgb is None:
-            self.out.put({"kind": "status", "text": src.status_message()})
+            self.out.put({"kind": "status", "text": self._brief(src.status_message())})
             return not src.dead                   # 连续取帧失败 → 交给调用方重连
         try:
             t1 = time.time()
             st = rec.recognize(rgb)
             t_rec = time.time() - t1
         except Exception as exc:
-            self.out.put({"kind": "error", "text": f"识别出错：{exc}"})
+            msg = f"识别出错：{exc}"
+            if self.verbose:
+                self._log(msg)
+            self.out.put({"kind": "error", "text": self._brief(msg)})
             return False                          # 丢掉连接，下轮重连
         if self.verbose:                          # 诊断：每帧耗时写日志，定位"慢在哪一段"
             tq, td = getattr(src, "last_timing", (0.0, 0.0))
@@ -235,9 +272,9 @@ class Overlay:
         self.root.configure(bg=BG)
         # Tk 的字号单位是「点」：24pt 在屏幕上约等于 32px，
         # 所以截断提示文案必须按真实宽度量（font.measure），靠估算会算少 1/3。
-        fam, size, weight = ui_font(HEAD_SIZE)
-        self.font = tkfont.Font(family=fam, size=size, weight=weight)
-        self.font_small = tkfont.Font(family=fam, size=ERROR_SIZE, weight=weight)
+        self._fonts: dict[int, tkfont.Font] = {}      # 字号 → Font（提示要按需缩小，缓存起来别每次新建）
+        self.font = self._font_at(HEAD_SIZE)
+        self.font_small = self._font_at(ERROR_SIZE)
 
         # 第一行：风向箭头 + 风速（按档位着色）+ 夹角，整行水平居中
         self.head = tk.Frame(self.root, bg=BG)
@@ -363,16 +400,9 @@ class Overlay:
 
     def _line1(self, text: str, color: str) -> None:
         """
-        提示/报错：用**小一号**字体，窗口尺寸尽量不动。
-        顺序是 —— 一行放得下就一行；放不下拆两行；两行还放不下才把窗口加宽（≤90% 屏幕）；
-        再不行才截断加「…」。
+        提示/报错：目标是**整句都看得见**，所以先缩字号、再考虑加宽，最后才截断。
         """
-        font = self.font_small
-        width = self.win_w - 2 * PAD - 6
-        if font.measure(text) <= width:
-            line1, line2 = text, ""
-        else:
-            line1, line2 = self._split(text, font, width)
+        font, line1, line2, w = self._fit_error(text)
         self.l_wind.config(text=line1, fg=color, font=font)
         self.l_ang.config(text="")
         self.l_ang.pack_configure(padx=0)                 # 夹角为空时不占位，才会真正居中
@@ -380,21 +410,83 @@ class Overlay:
         self.l_lon.config(text="")
         self.l_lat.pack_configure(padx=0)
         self.l_lon.pack_configure(padx=0)
-        need = max(font.measure(line1), font.measure(line2)) + 2 * PAD + 16
-        self._resize(max(self.win_w, need))               # 必要时加宽，保证不被切
+        self._resize(w)
 
-    def _split(self, text: str, font=None, width: int | None = None) -> tuple[str, str]:
-        """一行放不下就拆两行：优先在句子中间的自然分隔符处断；超过屏幕宽度的再截断。"""
-        font = font or self.font
-        width = self.text_px if width is None else width
-        cap = int(self.root.winfo_screenwidth() * 0.90) - 2 * PAD - 20
-        if font.measure(text) > cap:                  # 加宽也放不下 → 只能截断成一行
-            return self._fit(text, cap, font), ""
+    def _fit_error(self, text: str) -> tuple[tkfont.Font, str, str, int]:
+        """
+        给提示挑一套「字号 + 折行 + 窗口宽」：
+        ① 先在原窗口宽度里，用 18pt 折两行 —— 放得下就原样（宽度不变）；
+        ② 放不下就逐级缩小字号（18→16→14→12）再折，能塞下就不动窗口；
+        ③ 缩到下限还放不下，才把窗口加宽到刚好容下（最多占屏幕 90%），中间仍不做截断。
+
+        之所以要这一串：Windows 上 18pt 比 macOS 大一圈，长报错在原宽度里必然顶出去；
+        单靠拆分或单靠加宽都治不了，配合着来才能"整句可见"。
+        """
+        base = self.win_w
+        for size in range(ERROR_SIZE, ERR_MIN_SIZE - 1, -2):
+            width = base - 2 * PAD - 8
+            if self._fits2(text, size, width):
+                font = self._font_at(size)
+                line1, line2 = self._two_lines(text, font, width)
+                return font, line1, line2, base
+        font = self._font_at(ERR_MIN_SIZE)
+        cap = max(base, int(self.root.winfo_screenwidth() * 0.90))
+        width = cap - 2 * PAD - 8
+        line1, line2 = self._two_lines(text, font, width)
+        if font.measure(line2) > width:                   # 连屏幕 90% 都放不下 → 只能截断
+            line2 = self._fit(line2, width, font)
+        need = max(font.measure(line1), font.measure(line2)) + 2 * PAD + 8
+        return font, line1, line2, int(min(cap, max(base, need)))
+
+    def _font_at(self, size: int) -> tkfont.Font:
+        """取某个字号的字体（缓存）：提示放不下时要一级一级缩小，别每次都新建 Font 对象。"""
+        f = self._fonts.get(size)
+        if f is None:
+            fam, _, weight = ui_font(size)
+            f = tkfont.Font(family=fam, size=size, weight=weight)
+            self._fonts[size] = f
+        return f
+
+    def _fits2(self, text: str, size: int, width: int) -> bool:
+        """text 在 size 号字下，能否放进「两行 × width」里。"""
+        font = self._font_at(size)
+        if font.measure(text) <= width:
+            return True
+        line1, line2 = self._two_lines(text, font, width)
+        return font.measure(line1) <= width and font.measure(line2) <= width
+
+    def _two_lines(self, text: str, font, width: int) -> tuple[str, str]:
+        """
+        折两行：在候选断点里挑「最长那行最短」的一个。
+        候选 = 句子中间的自然分隔符 + 按宽度硬折的位置（硬折是兜底，两者都会参与比谁更均衡）。
+        只按分隔符断容易切出「一行很短、一行超宽」的畸形，所以这里改成按均衡度选。
+        """
+        if font.measure(text) <= width:
+            return text, ""
         mid = len(text) // 2
-        for i, ch in enumerate(text):
-            if ch in "（(：:，,、；; " and abs(i - mid) <= 8:
-                return text[:i], text[i:]
-        return text[:mid], text[mid:]
+        cands = [i for i, ch in enumerate(text)
+                 if ch in "（(：:，,、；; " and abs(i - mid) <= 10]
+        cands.append(len(self._take(text, font, width)) or 1)   # 按宽度硬折的位置
+        best, cost = cands[-1], None
+        for i in cands:
+            if 0 < i < len(text):
+                c = max(font.measure(text[:i]), font.measure(text[i:]))
+                if cost is None or c < cost:
+                    best, cost = i, c
+        return text[:best], text[best:]
+
+    def _take(self, text: str, font, width: int) -> str:
+        """能塞进 width 的最长前缀（不加省略号，二分找）。"""
+        if font.measure(text) <= width:
+            return text
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font.measure(text[:mid]) <= width:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo]
 
     def _resize(self, w: int) -> None:
         """改窗口宽度：贴住原来的右边缘（不跑出屏幕），高度不变。"""
