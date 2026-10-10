@@ -101,18 +101,27 @@ class Reader(threading.Thread):
     def run(self) -> None:
         src = rec = None
         backoff = 3.0                             # 连不上时的重试间隔（失败就翻倍，最长 30 秒）
+        self._log(f"启动：{sys.platform} / Python {sys.version.split()[0]} / "
+                  f"{O.FPS:g} 次每秒 / 日志 {os.path.join(os.path.expanduser('~'), 'nssr-overlay.log')}")
         while not self.stop.is_set():
             if src is None:                       # （重）连 OBS + 建识别器
+                if rec is None:                   # 识别器只建一次：它跟 OBS 无关，
+                    try:                          # 先建它，出问题就不会留下一截连上的 OBS 会话
+                        rec = O.Recognizer(SimpleNamespace(verbose=False))
+                    except Exception as exc:      # 本地环境问题（多半是字形库/依赖），照实说
+                        self._report(f"初始化失败：{exc}")
+                        self.stop.wait(backoff)
+                        backoff = min(backoff * 2.0, 30.0)
+                        continue
                 try:
                     src = O.make_source()
-                    rec = O.Recognizer(SimpleNamespace(verbose=False))
                     backoff = 3.0                 # 连上了，退避重置
+                    self._log(f"已连接：{src.note}")
                     self.out.put({"kind": "status", "text": "已连接，等待画面…"})
                 except Exception as exc:
                     full = f"连接 OBS 失败：{exc}"
                     print("\n" + full)                      # 终端里给完整信息（双击启动时无终端，无妨）
-                    if self.verbose:
-                        self._log(full)
+                    self._log(full)
                     self.out.put({"kind": "error", "text": self._conn_hint(full)})
                     self.stop.wait(backoff)       # 3→6→12→24→30 秒：别一秒一次地往 OBS 灌会话
                     backoff = min(backoff * 2.0, 30.0)
@@ -121,11 +130,7 @@ class Reader(threading.Thread):
             try:
                 alive = self._one_frame(src, rec, t0)
             except Exception as exc:              # 兜底：任何意外都不能让取帧线程死掉（窗口会冻住）
-                msg = f"识别线程异常：{exc}"
-                print("\n" + msg)
-                if self.verbose:
-                    self._log(msg)
-                self.out.put({"kind": "error", "text": self._brief(msg)})
+                self._report(f"识别线程异常：{exc}")
                 self.stop.wait(1.0)
                 alive = True
             if alive is False:                    # 连接/源已判死 → 先关上再丢，下轮重连
@@ -143,13 +148,22 @@ class Reader(threading.Thread):
         窗口只放一句**能照做的动作**，不放那一大段英文报错（报错全文照样打到终端/日志）。
 
         之前把"端口探针 + 分步清单"整段塞进窗口，300 多字符怎么排版都显示不全。
+        认得出原因的，给一句照做的动作；认不出的，把**真实原因**照实显示（别再一律说
+        "OBS 没开"，那正是"OBS 明明连着、程序却说连不上"这种误导的来源）。
         """
         low = full.lower()
         if ("password" in low) or ("auth" in low):
             return "连不上 OBS：请取消勾选「启用身份验证」再试"
         if ("10061" in full) or ("refused" in low) or ("完全连不上" in full):
             return "连不上 OBS：确认 OBS 已开、并启用了 WebSocket 服务器"
-        return "连不上 OBS：请确认 OBS 正在运行（详情看终端/日志）"
+        first = full.splitlines()[0].replace("连接 OBS 失败：", "").strip()
+        return Reader._brief(first, 46)
+
+    def _report(self, msg: str) -> None:
+        """把一条错误同时送到三处：终端、日志、窗口（窗口只放摘要）。"""
+        print("\n" + msg)
+        self._log(msg)
+        self.out.put({"kind": "error", "text": self._brief(msg)})
 
     @staticmethod
     def _brief(text: str, limit: int = 60) -> str:
@@ -180,17 +194,16 @@ class Reader(threading.Thread):
         rgb = src.read()
         t_read = time.time() - t0
         if rgb is None:
-            self.out.put({"kind": "status", "text": self._brief(src.status_message())})
+            msg = src.status_message()
+            self._log(msg)                        # 取帧失败是最容易出问题的一环，一律记进日志
+            self.out.put({"kind": "status", "text": self._brief(msg)})
             return not src.dead                   # 连续取帧失败 → 交给调用方重连
         try:
             t1 = time.time()
             st = rec.recognize(rgb)
             t_rec = time.time() - t1
         except Exception as exc:
-            msg = f"识别出错：{exc}"
-            if self.verbose:
-                self._log(msg)
-            self.out.put({"kind": "error", "text": self._brief(msg)})
+            self._report(f"识别出错：{exc}")
             return False                          # 丢掉连接，下轮重连
         if self.verbose:                          # 诊断：每帧耗时写日志，定位"慢在哪一段"
             tq, td = getattr(src, "last_timing", (0.0, 0.0))
@@ -240,7 +253,12 @@ class Reader(threading.Thread):
 
     @staticmethod
     def _log(line: str) -> None:
-        """诊断日志写到用户目录（--verbose 才写）；超过 2MB 就滚动一次，别无限长。"""
+        """
+        写诊断日志到用户目录（**总是写**：双击启动没有终端，出问题只能靠这个日志查）。
+
+        每帧的耗时明细仍然只在 --verbose 时写，平时只有启动/连接/报错这几行，文件很小。
+        超过 2MB 就滚动一次，别无限长。
+        """
         try:
             path = os.path.join(os.path.expanduser("~"), "nssr-overlay.log")
             if os.path.exists(path) and os.path.getsize(path) > 2 * 1024 * 1024:
@@ -618,7 +636,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="NSS 高尔夫风向 —— 桌面悬浮窗")
     p.add_argument("--alpha", type=float, default=0.5, help="窗口不透明度 0~1，默认 0.5")
     p.add_argument("-v", "--verbose", action="store_true",
-                   help="诊断：把每帧「取帧/识别」耗时写进 ~/nssr-overlay.log")
+                   help="诊断：每帧「取帧/识别」耗时也写进 ~/nssr-overlay.log（报错本来就写）")
     return p
 
 

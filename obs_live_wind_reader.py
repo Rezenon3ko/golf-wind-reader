@@ -144,6 +144,47 @@ def _probe_port(host: str, port: int) -> str:
                 f"或端口不是 {port}（改过端口就设环境变量 NSSR_OBS_PORT=新端口）")
 
 
+def _allow_local_direct() -> None:
+    """
+    把本机地址加进 no_proxy，保证连 OBS 不走代理。
+
+    很多玩家机器上挂着代理（Clash / V2Ray 等），有的会把 http_proxy 设成全局环境变量；
+    底层 websocket-client 会照单全收，于是连 ws://127.0.0.1:4455 也被塞进代理 ——
+    结果是：OBS 那边看到"有客户端连进来了"，客户端这边却在握手/识别阶段报错，
+    表现就是"明明连上了却一直报连不上"。本机直连既更快也不会被代理搅和。
+    """
+    for key in ("no_proxy", "NO_PROXY"):
+        cur = [x for x in os.environ.get(key, "").replace(" ", "").split(",") if x]
+        for host in ("127.0.0.1", "localhost", "::1"):
+            if host not in cur:
+                cur.append(host)
+        os.environ[key] = ",".join(cur)
+
+
+def _connect_client(host: str, port: int, password: str):
+    """
+    建 obs-websocket 客户端。失败就原样抛异常，但**先把半截 WebSocket 关掉**。
+
+    ReqClient 在「TCP 已连上、但握手/身份识别没走完」时抛异常，那时句柄还在它肚子里，
+    我们拿不到、也就关不掉 —— OBS 的「已连接的 WebSocket 会话」里就会挂一个永远不走的
+    僵尸连接（正是"OBS 显示已连接、程序却说连不上"这种情况的典型现场）。
+    """
+    import obsws_python as obs
+
+    class _Client(obs.ReqClient):
+        def __init__(self, **kw):
+            try:
+                super().__init__(**kw)
+            except Exception:
+                try:
+                    self.base_client.ws.close()
+                except Exception:
+                    pass
+                raise
+
+    return _Client(host=host, port=port, password=password, timeout=REQ_TIMEOUT)
+
+
 class ObsWebSocketSource:
     """通过 obs-websocket 抓 OBS 某个源的画面（JPEG 压缩换速度）。
 
@@ -162,6 +203,7 @@ class ObsWebSocketSource:
         self.last_error = ""                         # 最近一次取帧失败的原因
         self.fails = 0                               # 连续失败次数
         self.dead = False                            # 连接/源已经救不回来，该重连
+        self.note = ""                               # 连上后的说明（源名/分辨率/配置来源），供日志用
         self.last_timing: tuple[float, float] = (0.0, 0.0)   # (请求, 解码) 秒，诊断用
         self.cli = None                              # 连接句柄（close() 会用到）
         self._connect()
@@ -173,14 +215,12 @@ class ObsWebSocketSource:
         password = cfg["password"] if self.password is None else self.password
         cfg_from = cfg.get("from", "默认值")
         self.close()                                 # 重连前先关掉旧会话，别在 OBS 里留僵尸连接
+        _allow_local_direct()                        # 本机连接绕开代理
         try:
-            import obsws_python as obs
+            self.cli = _connect_client(self.host, port, password)
         except ImportError as exc:
             raise RuntimeError(
                 "websocket 取帧需要 obsws-python：pip install obsws-python") from exc
-        try:
-            self.cli = obs.ReqClient(host=self.host, port=port, password=password,
-                                     timeout=REQ_TIMEOUT)
         except Exception as exc:
             why = str(exc)
             low = why.lower()
@@ -203,11 +243,11 @@ class ObsWebSocketSource:
         inputs = self._inputs()
         self.source = self._pick_source(self.want_source, inputs)
         kind = next((i["kind"] for i in inputs if i["name"] == self.source), "")
-        print(f"[取帧] OBS 源「{self.source}」{f' ({kind})' if kind else ''} -> "
-              f"{self.width}×{self.height} "
-              f"{self.fmt.upper()} q={self.quality}"
-              f"（{self.host}:{port}，{'已带密码' if password else '无密码'}"
-              f"，配置来自 {cfg_from}）")
+        self.note = (f"OBS 源「{self.source}」{f'({kind})' if kind else ''} -> "
+                     f"{self.width}×{self.height} {self.fmt.upper()} q={self.quality}"
+                     f"（{self.host}:{port}，{'已带密码' if password else '无密码'}"
+                     f"，配置来自 {cfg_from}）")
+        print(f"[取帧] {self.note}")
         self.fails, self.dead = 0, False
 
     @staticmethod
