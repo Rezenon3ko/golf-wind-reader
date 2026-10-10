@@ -265,6 +265,7 @@ class Overlay:
         self.root.title("风向")
         self.root.overrideredirect(True)              # 无边框
         self.root.attributes("-topmost", True)        # 置顶
+        self._alpha = args.alpha
         try:
             self.root.attributes("-alpha", args.alpha)  # 半透明
         except Exception:
@@ -319,6 +320,8 @@ class Overlay:
             w.bind("<B1-Motion>", self._drag)
         self.menu = tk.Menu(self.root, tearoff=0)
         self.menu.add_command(label="退出", command=self.quit)
+        self._menu_at: tuple[int, int, int, int] | None = None   # 菜单弹出时占的屏幕区域（退出时要擦掉）
+        self._quitting = False
         for w in widgets:                             # 右键（macOS 用 Button-2）
             w.bind("<Button-3>", self._popup)
             w.bind("<Button-2>", self._popup)
@@ -345,6 +348,9 @@ class Overlay:
         self.root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
 
     def _popup(self, e) -> None:
+        # 记下菜单占的屏幕区域：Windows 上菜单被销毁后那块常常不会被重画，留个白框。
+        self._menu_at = (e.x_root, e.y_root,
+                         self.menu.winfo_reqwidth(), self.menu.winfo_reqheight())
         try:
             self.menu.tk_popup(e.x_root, e.y_root)
         finally:
@@ -515,21 +521,91 @@ class Overlay:
         退出。
 
         Windows 上如果直接在菜单回调里 destroy 窗口，右键菜单那个框有时不会被系统擦掉，
-        就"残影"留在屏幕上（窗口是半透明/置顶的 layered window，更容易出这毛病）。
-        所以：先收起菜单 → 关掉置顶 → 把窗口藏起来（让系统重画那块区域）→
-        等事件队列空一轮之后再真正销毁。
+        就"白框"留在屏幕上（窗口是半透明/置顶的 layered window，更容易出这毛病）。
+        所以先把菜单收起来、关掉置顶、把窗口藏起来，等事件真正处理完再销毁；
+        菜单刚消失、窗口刚销毁这两个时刻各擦一次那块屏幕 —— 这才是清残影的关键一步。
         """
+        if self._quitting:
+            return
+        self._quitting = True
         self.stop.set()
+        rects = self._dead_rects()
         try:
             self.menu.unpost()            # 收起菜单
+            self.root.update()            # 让"收起菜单"真正发生（update_idletasks 不处理它）
             self.menu.destroy()           # 连菜单窗口一起销毁 —— 不销毁它就可能在屏幕上留个"退出"小框
             self.root.attributes("-topmost", False)
             self.root.withdraw()
-            self.root.update_idletasks()
+            self.root.update()
         except Exception:
             pass
-        # 再等 120ms（Windows 的菜单淡出动画要一会儿），然后真正销毁
-        self.root.after(120, self.root.destroy)
+        self._erase(rects)                # 先把菜单那块擦一遍（这时菜单刚没，最可能出现白框）
+        # 再等 150ms（Windows 的菜单淡出动画要一会儿），然后真正销毁
+        self.root.after(150, self._finish)
+
+    def _finish(self) -> None:
+        """真正退出前的最后一件事：销毁窗口 + 擦掉桌面残影。"""
+        rects = self._dead_rects()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        self._erase(rects)
+
+    def _dead_rects(self) -> list[tuple[int, int, int, int]]:
+        """
+        退出时可能留残影的两块区域（屏幕坐标）：弹出的右键菜单 + 悬浮窗本身。
+        菜单四周再多留 10px —— Tk 可能把菜单挪了点位置，或者带一圈边/阴影，宁可多擦一点。
+        """
+        raw = []
+        if self._menu_at:
+            raw.append(self._menu_at)
+        try:
+            raw.append((self.root.winfo_rootx(), self.root.winfo_rooty(), self.cur_w, self.win_h))
+        except Exception:
+            pass
+        m = 10
+        return [(x - m, y - m, w + 2 * m, h + 2 * m) for x, y, w, h in raw]
+
+    @staticmethod
+    def _erase(rects: list[tuple[int, int, int, int]]) -> None:
+        """
+        Windows 专属兜底：让这几块区域**下面的窗口**重画一遍，擦掉被销毁的菜单/窗口留下的白框。
+
+        Tk 的 layered 窗口（-alpha）加上弹出菜单，销毁后那块区域常常"没人重画"，
+        残影就这么贴在屏幕上。这里对着区域的几个点问系统"这块是谁的窗口"，
+        让它把整窗失效重画 —— 不管残影是谁留下的，那块都会被重画掉。
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class POINT(ctypes.Structure):
+                _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+            u = ctypes.windll.user32
+            u.WindowFromPoint.restype = wintypes.HWND
+            u.WindowFromPoint.argtypes = [POINT]
+            u.GetAncestor.restype = wintypes.HWND
+            u.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+            u.InvalidateRect.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.BOOL]
+            GA_ROOT = 2
+            targets = set()
+            for x, y, w, h in rects:
+                if w <= 0 or h <= 0:
+                    continue
+                for px, py in ((x + w // 2, y + h // 2), (x + 2, y + 2),
+                               (x + w - 3, y + h - 3), (x + w // 2, y + 2),
+                               (x + w // 2, y + h - 3)):
+                    hw = u.WindowFromPoint(POINT(int(px), int(py)))
+                    if hw:
+                        targets.add(u.GetAncestor(hw, GA_ROOT) or hw)
+            for hw in (targets or {0}):       # 什么都没找到就当桌面
+                u.InvalidateRect(hw, None, True)     # 整窗失效 → 由它自己重画（含被白框盖住的那块）
+        except Exception:
+            pass
 
     def run(self) -> None:
         self.root.mainloop()
