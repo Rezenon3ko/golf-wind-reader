@@ -77,7 +77,8 @@ def ui_font(size: int, bold: bool = True):
     return (family, size, "bold" if bold else "normal")
 
 
-HEAD_SIZE = 24                 # 两行同一个字号：第一行 箭头+风速+夹角，第二行 横向/纵向分量
+HEAD_SIZE = 24                 # 正常显示的字号（两行统一）
+ERROR_SIZE = HEAD_SIZE - 6     # 提示/报错的字号：小一号，Windows 上 24pt 太大、长句会被切
 GAP = 10                       # 同一行里两项之间的间距（两行共用一个值）
 # 量窗口尺寸用的"最长一行"样本（定死尺寸，文字变长也不会跑出屏幕）
 SAMPLES = (("↘  15 m/s", "+179.9°", "→ 13.55", "↑ 13.55"),   # 正常结果的最宽一拍
@@ -236,6 +237,7 @@ class Overlay:
         # 所以截断提示文案必须按真实宽度量（font.measure），靠估算会算少 1/3。
         fam, size, weight = ui_font(HEAD_SIZE)
         self.font = tkfont.Font(family=fam, size=size, weight=weight)
+        self.font_small = tkfont.Font(family=fam, size=ERROR_SIZE, weight=weight)
 
         # 第一行：风向箭头 + 风速（按档位着色）+ 夹角，整行水平居中
         self.head = tk.Frame(self.root, bg=BG)
@@ -349,33 +351,45 @@ class Overlay:
             # 数字部分统一用当前风速档位的颜色
             ang = w.get("theta_signed_deg", w["theta_deg"])
             col = speed_color(w["speed"])
-            self.l_wind.config(text=f"{wind_arrow(w['theta_deg'])}  {w['speed']:g} m/s", fg=col)
-            self.l_ang.config(text=f"{ang:+.1f}°")
+            self.l_wind.config(text=f"{wind_arrow(w['theta_deg'])}  {w['speed']:g} m/s",
+                               fg=col, font=self.font)
+            self.l_ang.config(text=f"{ang:+.1f}°", font=self.font)
             # 第二行沿用第一行的排法：箭头 + 两个空格 + 数值
             # 颜色各自按**自己的数值**取档位（横向 7 → 黄、纵向 12 → 品红），不是跟着总风速
             self.l_lat.config(text=f"{LAT_ARROW.get(w['lateral_dir'], '·')}  {w['lateral_abs']:.2f}",
-                              fg=speed_color(w["lateral_abs"]))
+                              fg=speed_color(w["lateral_abs"]), font=self.font)
             self.l_lon.config(text=f"{LON_ARROW.get(w['longitudinal_dir'], '·')}  {w['longitudinal_abs']:.2f}",
-                              fg=speed_color(w["longitudinal_abs"]))
+                              fg=speed_color(w["longitudinal_abs"]), font=self.font)
 
     def _line1(self, text: str, color: str) -> None:
         """
-        提示写进窗口，**窗口尺寸不变**：一行放得下就放第一行；放不下就在靠中间的自然位置
-        （「（」「：」「，」…）拆成两行，第二行借用下面那行的位置，两行各自居中。
+        提示/报错：用**小一号**字体，窗口尺寸尽量不动。
+        顺序是 —— 一行放得下就一行；放不下拆两行；两行还放不下才把窗口加宽（≤90% 屏幕）；
+        再不行才截断加「…」。
         """
-        line1, line2 = self._split(text)
-        self.l_wind.config(text=self._fit(line1), fg=color)
+        font = self.font_small
+        width = self.win_w - 2 * PAD - 6
+        if font.measure(text) <= width:
+            line1, line2 = text, ""
+        else:
+            line1, line2 = self._split(text, font, width)
+        self.l_wind.config(text=line1, fg=color, font=font)
         self.l_ang.config(text="")
         self.l_ang.pack_configure(padx=0)                 # 夹角为空时不占位，才会真正居中
-        self.l_lat.config(text=self._fit(line2), fg=color)
+        self.l_lat.config(text=line2, fg=color, font=font)
         self.l_lon.config(text="")
         self.l_lat.pack_configure(padx=0)
         self.l_lon.pack_configure(padx=0)
+        need = max(font.measure(line1), font.measure(line2)) + 2 * PAD + 16
+        self._resize(max(self.win_w, need))               # 必要时加宽，保证不被切
 
-    def _split(self, text: str) -> tuple[str, str]:
-        """一行放不下就拆两行：优先在句子中间的自然分隔符处断。"""
-        if self.font.measure(text) <= self.text_px:
-            return text, ""
+    def _split(self, text: str, font=None, width: int | None = None) -> tuple[str, str]:
+        """一行放不下就拆两行：优先在句子中间的自然分隔符处断；超过屏幕宽度的再截断。"""
+        font = font or self.font
+        width = self.text_px if width is None else width
+        cap = int(self.root.winfo_screenwidth() * 0.90) - 2 * PAD - 20
+        if font.measure(text) > cap:                  # 加宽也放不下 → 只能截断成一行
+            return self._fit(text, cap, font), ""
         mid = len(text) // 2
         for i, ch in enumerate(text):
             if ch in "（(：:，,、；; " and abs(i - mid) <= 8:
@@ -390,9 +404,9 @@ class Overlay:
         self.cur_w = w
         self.root.geometry(f"{w}x{self.win_h}+{int(x)}+{self.root.winfo_y()}")
 
-    def _fit(self, text: str, limit: int | None = None) -> str:
+    def _fit(self, text: str, limit: int | None = None, font=None) -> str:
         """用真实字体宽度截断提示（Tk 字号单位是点，估算必偏小、会顶出窗口）。"""
-        limit, font = (self.text_px if limit is None else limit), self.font
+        limit, font = (self.text_px if limit is None else limit), (font or self.font)
         if font.measure(text) <= limit:
             return text
         lo, hi = 0, len(text)                      # 二分找最长能放下的前缀
