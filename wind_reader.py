@@ -1107,13 +1107,39 @@ def ocr_speed(rgb: np.ndarray, dial: Dial, state: OcrState | None = None) -> dic
 _GLYPH_SIZE = (32, 48)
 
 
-def _glyph_norm(crop: Image.Image) -> np.ndarray | None:
-    """把单个字形归一化成固定大小的二值图（去边、等比缩放、居中）。"""
+def _line_band(mask: np.ndarray) -> tuple[int, int]:
+    """
+    文字行的公共"上下沿"（行基准）。
+
+    用整行的墨迹行剖面取主体（掐掉抗锯齿毛边）—— 这一行里 `m/s` 永远存在、
+    字高永远一样，拿它当基准比让每个字自己围包围盒稳得多。
+    """
+    rows = mask.sum(axis=1)
+    if rows.max() <= 0:
+        return 0, mask.shape[0]
+    idx = np.nonzero(rows >= max(1.0, 0.25 * float(rows.max())))[0]
+    return int(idx[0]), int(idx[-1]) + 1
+
+
+def _glyph_norm(crop: Image.Image,
+                band: tuple[int, int] | None = None) -> np.ndarray | None:
+    """
+    把单个字形归一化成固定大小的二值图（等比缩放）。
+
+    band 是文字行的公共上下沿（见 _line_band）。**优先信它**，而不是字形自己的包围盒：
+    抗锯齿多出来的那一两行/一两列会把细笔画（比如 "1"）整个压扁，分数就掉一大截。
+    给了 band 就按它定高度；水平方向仍按本字形自己的墨迹取满 —— 宽度正是区分数字的
+    依据，不能掐（"1" 顶上那个小撇子墨很少，一掐就只剩一根竖杠了）。
+    """
     m = _bin_white(crop)
-    ys, xs = np.nonzero(m)
+    h = m.shape[0]
+    y0, y1 = band if band else (0, h)
+    y0, y1 = max(0, min(int(y0), h - 1)), max(1, min(int(y1), h))
+    sub = m[y0:y1]
+    ys, xs = np.nonzero(sub)
     if len(ys) < 12:
         return None
-    sub = m[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    sub = sub[:, xs.min():xs.max() + 1]
     im = Image.fromarray((sub * 255).astype(np.uint8)).resize(_GLYPH_SIZE, Image.BILINEAR)
     return (np.asarray(im) > 110).astype(np.float32)
 
@@ -1235,10 +1261,11 @@ def match_glyphs(crop: Image.Image,
     bank = (state or _DEFAULT_OCR).bank
     if not bank:
         return None
+    band = _line_band(_bin_white(crop))      # 行基准：所有字形共用同一套上下沿
     for win in _glyph_windows(crop):
         out, worst = "", 1.0
         for a, b in win:
-            g = _glyph_norm(crop.crop((a, 0, b, crop.height)))
+            g = _glyph_norm(crop.crop((a, 0, b, crop.height)), band)
             if g is None:
                 break
             best, second = 0.0, 0.0
