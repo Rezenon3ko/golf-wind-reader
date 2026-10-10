@@ -133,6 +133,12 @@ HOLD_BAD = 3          # 连续这么多帧没识别出来…
 HOLD_SEC = 2.5        # …且距上次成功超过这么多秒，才把提示刷到窗口。
                       # 两个条件都要满足：单帧失败一律按住（慢机器一帧 2~3 秒，只看时间会一失败就弹提示）
 
+# ---- 占盘上限：日志 + 诊断图总共不超过 5MB ----
+LOG_ROLL = 1 * 1024 * 1024        # 日志写到 1MB 就滚动一次（保留上一轮 → 日志最多 2MB）
+DUMP_BUDGET = 2 * 1024 * 1024     # 所有诊断图加起来不超过 2MB（超了按时间删旧的）
+DUMP_MAX_W = 1280                 # 诊断图缩到最宽 1280：够看上下文，体积只有几十~几百 KB
+DUMP_Q = 80                       # 整帧存 JPEG（有损但够看）；数字框另存无损 PNG（那才是要抠字形的地方）
+
 
 def ui_font(size: int, bold: bool = True):
     family = "PingFang SC" if sys.platform == "darwin" else "Microsoft YaHei"
@@ -165,6 +171,7 @@ class Reader(threading.Thread):
         backoff = 3.0                             # 连不上时的重试间隔（失败就翻倍，最长 30 秒）
         self._log(f"启动：{sys.platform} / Python {sys.version.split()[0]} / "
                   f"{O.FPS:g} 次每秒 / 日志 {os.path.join(_artifact_dir(), 'nssr-overlay.log')}")
+        self._prune_dumps()                       # 旧诊断图超预算先清掉（含旧版本留下的 .png）
         while not self.stop.is_set():
             if src is None:                       # （重）连 OBS + 建识别器
                 if rec is None:                   # 识别器只建一次：它跟 OBS 无关，
@@ -301,22 +308,32 @@ class Reader(threading.Thread):
 
     _DUMPS = 0
 
-    def _dump(self, rgb, st: dict) -> None:
-        """把"读不出风速"的那一帧和数字框存成 PNG，最多 3 张（循环覆盖），方便离线定位。"""
+    @staticmethod
+    def _dump(rgb, st: dict) -> None:
+        """
+        把"读不出风速"的那一帧存下来（最多 3 组，循环覆盖），方便离线定位。
+
+        整帧缩到 1280 宽存 JPEG（体积小，看上下文够用）；数字框单独放大 4× 存 PNG，
+        因为要抠字形的是它，不能有 JPEG 噪点。
+        """
         if Reader._DUMPS >= 3:
             return
         Reader._DUMPS += 1
         try:
             d = _artifact_dir()
-            p = os.path.join(d, f"nssr-fail-{Reader._DUMPS}.png")
-            Image.fromarray(rgb).save(p)
+            p = os.path.join(d, f"nssr-fail-{Reader._DUMPS}.jpg")
+            im = Image.fromarray(rgb)
+            if im.width > DUMP_MAX_W:
+                im = im.resize((DUMP_MAX_W, max(1, int(im.height * DUMP_MAX_W / im.width))),
+                               Image.BILINEAR)
+            im.save(p, quality=DUMP_Q)
             box = (st.get("ocr") or {}).get("box")
             if box:
                 x0, y0, x1, y1 = box
                 Image.fromarray(rgb[y0:y1, x0:x1]).resize(
                     ((x1 - x0) * 4, (y1 - y0) * 4), Image.NEAREST).save(
                     os.path.join(d, f"nssr-fail-{Reader._DUMPS}-box.png"))
-            self._log(f"已存诊断图 {p}（数字框 {box}）")
+            Reader._log(f"已存诊断图 {p}（数字框 {box}）")
         except Exception:
             pass
 
@@ -327,16 +344,47 @@ class Reader(threading.Thread):
 
         位置在程序所在文件夹（exe / .app 旁边）；写不进去才退回用户主目录。
         内容：启动、连接、报错、越界读数，外加每 10 秒一条耗时"体检"行。
-        超过 2MB 就滚动一次，别无限长。
+        写到 1MB 就滚动一次、只留上一轮（.log.1），所以日志最多 2MB。
         """
         try:
             path = os.path.join(_artifact_dir(), "nssr-overlay.log")
-            if os.path.exists(path) and os.path.getsize(path) > 2 * 1024 * 1024:
-                os.replace(path, path + ".1")      # 保留上一轮，日志总共最多 ~4MB
+            if os.path.exists(path) and os.path.getsize(path) > LOG_ROLL:
+                os.replace(path, path + ".1")      # 只留上一轮：日志总共最多 2×LOG_ROLL
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(f"{time.strftime('%H:%M:%S')}  {line}\n")
         except Exception:
             pass
+
+    @staticmethod
+    def _prune_dumps() -> None:
+        """
+        诊断图总量超过 DUMP_BUDGET 就按时间删旧的（顺手清掉旧版本留下的 .png）。
+
+        这样"日志 ≤2MB + 诊断图 ≤2MB"，整个程序在磁盘上最多 5MB 以内。
+        """
+        d = _artifact_dir()
+        try:
+            names = [n for n in os.listdir(d) if n.startswith("nssr-fail-")]
+        except Exception:
+            return
+        items = []
+        total = 0
+        for n in names:
+            p = os.path.join(d, n)
+            try:
+                st = os.stat(p)
+            except Exception:
+                continue
+            items.append((st.st_mtime, st.st_size, p))
+            total += st.st_size
+        for _, size, p in sorted(items):            # mtime 最早的先删
+            if total <= DUMP_BUDGET:
+                break
+            try:
+                os.remove(p)
+                total -= size
+            except Exception:
+                pass
 
 
 # --------------------------------------------------------------------------
