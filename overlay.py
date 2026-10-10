@@ -98,15 +98,18 @@ class Reader(threading.Thread):
 
     def run(self) -> None:
         src = rec = None
+        backoff = 3.0                             # 连不上时的重试间隔（失败就翻倍，最长 30 秒）
         while not self.stop.is_set():
             if src is None:                       # （重）连 OBS + 建识别器
                 try:
                     src = O.make_source()
                     rec = O.Recognizer(SimpleNamespace(verbose=False))
+                    backoff = 3.0                 # 连上了，退避重置
                     self.out.put({"kind": "status", "text": "已连接，等待画面…"})
                 except Exception as exc:
                     self.out.put({"kind": "error", "text": f"连接 OBS 失败：{exc}"})
-                    self.stop.wait(3.0)           # 3 秒后重试（先开悬浮窗、后开 OBS 也行）
+                    self.stop.wait(backoff)       # 3→6→12→24→30 秒：别一秒一次地往 OBS 灌会话
+                    backoff = min(backoff * 2.0, 30.0)
                     continue
             t0 = time.time()
             try:
@@ -115,11 +118,27 @@ class Reader(threading.Thread):
                 self.out.put({"kind": "error", "text": f"识别线程异常：{exc}"})
                 self.stop.wait(1.0)
                 alive = True
-            if alive is False:                    # 连接/源已判死 → 丢掉，下轮重连（顺便重新挑源）
+            if alive is False:                    # 连接/源已判死 → 先关上再丢，下轮重连
+                self._drop(src)
                 src = None
+                self.stop.wait(backoff)           # 重连前也等一下（同样退避），别秒连秒断
+                backoff = min(backoff * 2.0, 30.0)
             rest = 1.0 / O.FPS - (time.time() - t0)
             if rest > 0:
                 self.stop.wait(rest)
+
+    @staticmethod
+    def _drop(src) -> None:
+        """
+        丢掉连接前先关掉它。
+
+        之前直接 `src = None` 就不管了 —— 底层 WebSocket 要等 GC 才关，
+        OBS 的「已连接的 WebSocket 会话」里就会堆一堆僵尸会话（每个挂几十秒）。
+        """
+        try:
+            src.close()
+        except Exception:
+            pass
 
     def _one_frame(self, src, rec, t0: float) -> bool:
         """跑一帧：取帧 → 识别 → 决定要不要把结果丢给窗口。返回 False 表示该重连。"""
@@ -183,9 +202,11 @@ class Reader(threading.Thread):
 
     @staticmethod
     def _log(line: str) -> None:
-        """诊断日志写到用户目录，方便把内容发回来（--verbose 才写）。"""
+        """诊断日志写到用户目录（--verbose 才写）；超过 2MB 就滚动一次，别无限长。"""
         try:
             path = os.path.join(os.path.expanduser("~"), "nssr-overlay.log")
+            if os.path.exists(path) and os.path.getsize(path) > 2 * 1024 * 1024:
+                os.replace(path, path + ".1")      # 保留上一轮，日志总共最多 ~4MB
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(f"{time.strftime('%H:%M:%S')}  {line}\n")
         except Exception:

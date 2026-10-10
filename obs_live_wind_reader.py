@@ -23,6 +23,7 @@ import io
 import json
 import math
 import os
+import socket
 import sys
 import time
 
@@ -74,34 +75,73 @@ FLIP_RUN = 3                       # 连续这么多次"反向"才认为真的�
 # 一、取帧：obs-websocket 抓源
 # ==========================================================================
 
-def _obs_ws_defaults() -> dict:
-    """读 OBS 自己的 obs-websocket 配置（端口 / 密码）。
-
-    密码在 OBS 配置里是 base64 存的，这里解出来；解不了就当明文用。
-    """
+def _obs_ws_config_paths() -> list[str]:
+    """obs-websocket 配置文件的候选位置（标准安装 + 便携模式 + 老式路径）。"""
+    home = os.path.expanduser("~")
+    rel = os.path.join("plugin_config", "obs-websocket", "config.json")
     if sys.platform == "darwin":
-        path = os.path.expanduser(
-            "~/Library/Application Support/obs-studio/plugin_config/obs-websocket/config.json")
+        base = os.path.join(home, "Library", "Application Support")
     elif sys.platform.startswith("win"):
-        path = os.path.join(os.environ.get("APPDATA", ""), "obs-studio",
-                            "plugin_config", "obs-websocket", "config.json")
+        base = os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
     else:
-        path = os.path.expanduser(
-            "~/.config/obs-studio/plugin_config/obs-websocket/config.json")
-    cfg = {"port": 4455, "password": ""}
-    try:
-        with open(path, encoding="utf-8") as fh:
-            j = json.load(fh)
-        cfg["port"] = int(j.get("server_port", 4455) or 4455)
-        raw = j.get("server_password", "") or ""
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    return [
+        os.path.join(base, "obs-studio", rel),                 # 标准安装
+        os.path.join(os.getcwd(), "config", "obs-studio", rel),  # 便携模式（程序目录下）
+        os.path.join(home, "obs-studio", rel),                  # 便携模式（用户目录下）
+    ]
+
+
+def _obs_ws_defaults() -> dict:
+    """
+    读 OBS 自己的 obs-websocket 配置（地址 / 端口 / 密码）。
+
+    开了「身份验证」时，客户端必须带对密码才能连 —— 我们在这里自动读出来。
+    密码在配置里是 base64；顺手兼容几个键名（server_password / auth_password / password）。
+    另外支持用环境变量覆盖：NSSR_OBS_HOST / NSSR_OBS_PORT / NSSR_OBS_PASSWORD
+    （读不到配置文件时，玩家设一个环境变量就能连，不用改代码）。
+    """
+    cfg = {"host": os.environ.get("NSSR_OBS_HOST") or "127.0.0.1",
+           "port": 4455, "password": "", "from": "默认值"}
+    for path in _obs_ws_config_paths():
+        try:
+            with open(path, encoding="utf-8") as fh:
+                j = json.load(fh)
+        except Exception:
+            continue
+        try:
+            cfg["port"] = int(j.get("server_port") or cfg["port"])
+        except Exception:
+            pass
+        raw = str(j.get("server_password") or j.get("auth_password")
+                  or j.get("password") or "")
         if raw:
             try:
                 cfg["password"] = base64.b64decode(raw, validate=True).decode("utf-8")
             except Exception:
-                cfg["password"] = raw
-    except Exception:
-        pass
+                cfg["password"] = raw          # 已经是明文
+        cfg["from"] = path
+        break
+    if os.environ.get("NSSR_OBS_PORT"):
+        try:
+            cfg["port"] = int(os.environ["NSSR_OBS_PORT"])
+            cfg["from"] = "环境变量 NSSR_OBS_PORT"
+        except Exception:
+            pass
+    if os.environ.get("NSSR_OBS_PASSWORD"):
+        cfg["password"] = os.environ["NSSR_OBS_PASSWORD"]
     return cfg
+
+
+def _probe_port(host: str, port: int) -> str:
+    """连不上时探一下端口，给一句人话原因（区分"没服务" vs "密码不对"）。"""
+    try:
+        with socket.create_connection((host, port), timeout=1.5):
+            return (f"TCP {host}:{port} 能连上，但 WebSocket 握手失败 → 多半是密码/身份验证；"
+                    f"OBS → 工具 → WebSocket 服务器设置里取消「启用身份验证」并点「应用」")
+    except Exception:
+        return (f"TCP {host}:{port} 完全连不上 → OBS 没启动、没勾「启用 WebSocket 服务器」，"
+                f"或端口不是 {port}（改过端口就设环境变量 NSSR_OBS_PORT=新端口）")
 
 
 class ObsWebSocketSource:
@@ -123,6 +163,7 @@ class ObsWebSocketSource:
         self.fails = 0                               # 连续失败次数
         self.dead = False                            # 连接/源已经救不回来，该重连
         self.last_timing: tuple[float, float] = (0.0, 0.0)   # (请求, 解码) 秒，诊断用
+        self.cli = None                              # 连接句柄（close() 会用到）
         self._connect()
 
     def _connect(self) -> None:
@@ -130,6 +171,8 @@ class ObsWebSocketSource:
         cfg = _obs_ws_defaults()                     # 没显式给就用 OBS 配置里的
         port = cfg["port"] if self.port is None else self.port
         password = cfg["password"] if self.password is None else self.password
+        cfg_from = cfg.get("from", "默认值")
+        self.close()                                 # 重连前先关掉旧会话，别在 OBS 里留僵尸连接
         try:
             import obsws_python as obs
         except ImportError as exc:
@@ -139,14 +182,32 @@ class ObsWebSocketSource:
             self.cli = obs.ReqClient(host=self.host, port=port, password=password,
                                      timeout=REQ_TIMEOUT)
         except Exception as exc:
-            raise RuntimeError(f"连不上 OBS WebSocket（{self.host}:{port}）：{exc}") from exc
+            why = str(exc)
+            low = why.lower()
+            hint = ""
+            if ("password" in low) or ("auth" in low):
+                hint = ("\n  提示：OBS 开着「身份验证」，但没能自动读到密码。两种解法：\n"
+                        "        1) OBS → 工具 → WebSocket 服务器设置 → 取消勾选「启用身份验证」\n"
+                        "           （只监听本机，够安全）；\n"
+                        "        2) 或设环境变量 NSSR_OBS_PASSWORD=你的密码 后再启动。")
+            elif ("refused" in low or "10061" in low or "timed out" in low
+                  or "timeout" in low or "unreachable" in low or "no route" in low
+                  or "operation not permitted" in low):
+                hint = (f"\n  提示：{self.host}:{port} 上没有 OBS 在听（跟身份认证无关）。依次确认：\n"
+                        "        1) OBS 正在运行；\n"
+                        "        2) OBS → 工具 → WebSocket 服务器设置 → 勾选「启用 WebSocket 服务器」；\n"
+                        f"        3) 程序和 OBS 在同一台机器上（虚拟机/宿主机算两台；"
+                        f"换机器就设 NSSR_OBS_HOST=那台的IP）。")
+            raise RuntimeError(f"连不上 OBS WebSocket（{self.host}:{port}）：{why}\n"
+                               f"  {_probe_port(self.host, port)}{hint}") from exc
         inputs = self._inputs()
         self.source = self._pick_source(self.want_source, inputs)
         kind = next((i["kind"] for i in inputs if i["name"] == self.source), "")
         print(f"[取帧] OBS 源「{self.source}」{f' ({kind})' if kind else ''} -> "
               f"{self.width}×{self.height} "
               f"{self.fmt.upper()} q={self.quality}"
-              f"（{self.host}:{port}，{'已带密码' if password else '无密码'}）")
+              f"（{self.host}:{port}，{'已带密码' if password else '无密码'}"
+              f"，配置来自 {cfg_from}）")
         self.fails, self.dead = 0, False
 
     @staticmethod
@@ -242,15 +303,19 @@ class ObsWebSocketSource:
         return f"取不到画面：{why}"
 
     def close(self) -> None:
+        """关掉 WebSocket 会话（重连/退出时都要关，否则 OBS 会话列表里会堆僵尸连接）。"""
+        cli, self.cli = self.cli, None
         try:
-            self.cli.disconnect()
+            cli.disconnect()
         except Exception:
             pass
 
 
 def make_source():
-    """按默认约定建取帧器：源名自动识别、端口/密码读 OBS 配置、1080p JPEG q100。"""
-    return ObsWebSocketSource(source=None, host=OBS_HOST, port=None, password=None,
+    """按默认约定建取帧器：源名自动识别、地址/端口/密码读 OBS 配置（可用环境变量覆盖）。"""
+    cfg = _obs_ws_defaults()
+    return ObsWebSocketSource(source=None, host=cfg["host"], port=cfg["port"],
+                              password=cfg["password"],
                               width=WIDTH, height=HEIGHT, quality=QUALITY)
 
 
