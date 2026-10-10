@@ -1036,7 +1036,7 @@ def _find_text_lines(rgb: np.ndarray, dial: Dial,
              if 0.10 * r <= c.h <= 0.75 * r and c.w >= 2
              and 0.12 <= c.w / float(c.h) <= 2.8]          # 排除细长分隔线/圆环弧
     if not comps:
-        return None
+        return []          # 必须返回空列表：调用方是 for...in，返回 None 会 TypeError
     # 按 y 分组成"行"，取总面积最大的一行（真实文字行的面积远大于面板网点斑点）
     comps.sort(key=lambda c: c.cy)
     lines: list[list] = []

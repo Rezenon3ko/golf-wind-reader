@@ -161,6 +161,7 @@ class Reader(threading.Thread):
     def __init__(self, out: queue.Queue, stop: threading.Event):
         super().__init__(daemon=True)
         self.out, self.stop = out, stop
+        self._last_msg, self._last_msg_t = "", 0.0   # 同样的报错 10 秒内只报一次，别刷屏
         self.have_good = False       # 是否出过至少一次好结果
         self.last_ok = 0.0           # 上一次识别成功的时间
         self.bad = 0                 # 连续没识别出来的帧数（要和 last_ok 一起判断才提示）
@@ -229,7 +230,16 @@ class Reader(threading.Thread):
         return Reader._brief(first, 46)
 
     def _report(self, msg: str) -> None:
-        """把一条错误同时送到三处：终端、日志、窗口（窗口只放摘要）。"""
+        """
+        把一条错误同时送到三处：终端、日志、窗口（窗口只放摘要）。
+
+        同一条错误 10 秒内只报一次：一帧一次的重复报错会把日志刷爆，
+        而窗口上显示的本来就是那句，不用反复重画。
+        """
+        now = time.time()
+        if msg == self._last_msg and now - self._last_msg_t < 10.0:
+            return
+        self._last_msg, self._last_msg_t = msg, now
         print("\n" + msg)
         self._log(msg)
         self.out.put({"kind": "error", "text": self._brief(msg)})
@@ -273,7 +283,13 @@ class Reader(threading.Thread):
             t_rec = time.time() - t1
         except Exception as exc:
             self._report(f"识别出错：{exc}")
-            return False                          # 丢掉连接，下轮重连
+            # 识别出错是**本地算法**的问题，跟 OBS 连接无关：丢掉定位缓存下帧重找就行。
+            # 早先这里 return False 会连 OBS 一起扔掉 → 每 3 秒"已连接"一次，日志刷屏还一直不好用。
+            try:
+                rec.reset()
+            except Exception:
+                pass
+            return True
         now = time.time()
         if now >= self.next_beat:                 # 每 10 秒记一条"体检"行：够定位慢在哪一段，又不刷屏
             self.next_beat = now + 10.0
@@ -291,8 +307,10 @@ class Reader(threading.Thread):
             self._log(f"读数越界已丢弃：读成 {rej['value']} m/s"
                       f"（置信 {rej['conf']:.2f}，框 {rej['box']}）")
             self._dump(rgb, st)
-        elif st.get("speed") is None:
-            self._dump(rgb, st)                   # 读不出风速：存帧（最多 3 张，循环覆盖）
+        elif st.get("dial") is not None:
+            # 定位到了风盘却读不出风速 —— 这才值得存帧。没定位到（没在瞄准界面）不存，
+            # 否则 3 个名额会被一堆废帧占满。
+            self._dump(rgb, st)
         if st.get("ok"):
             self.have_good, self.last_ok, self.bad = True, time.time(), 0
         else:

@@ -412,20 +412,22 @@ class Recognizer:
 
     # ---- 定位 ----
     def locate(self, rgb) -> bool:
-        # 第一次定位成功就锁定左右手（右/左），之后所有搜索只在这一侧 —— 玩家一局不会换手，
-        # 锁了之后就不会再跑到对侧误抓白色 UI 当风盘（那会一直报"风速未识别"）。
+        # 定位只负责找风盘；**锁左右手放在"真读出结果"之后**（见 recognize）——
+        # 只看几何的话，一次假风盘就会把侧别锁死在对侧，之后一直读不出来。
         dials = W.find_dials(rgb, verbose=self.args.verbose, side=self.side)
         if not dials:
             return False
         d = dials[0]
         self.dial = d
         self.shape = rgb.shape[:2]
-        if self.side is None:
-            self.side = "右" if d.cx >= rgb.shape[1] / 2.0 else "左"
         if self.args.verbose:
             print(f"\n[定位] 风盘 中心=({d.cx:.0f},{d.cy:.0f}) r={d.r:.0f} k={d.k:.3f}"
                   f" 侧别={'右' if d.cx >= rgb.shape[1] / 2.0 else '左'}")
         return True
+
+    def reset(self) -> None:
+        """丢掉缓存的定位（保留左右手锁定），下帧重新找 —— 识别出错时用。"""
+        self.dial, self.shape, self.bad = None, None, 0
 
     def recognize(self, rgb) -> dict:
         t0 = time.time()
@@ -444,6 +446,8 @@ class Recognizer:
         fr = W.read_wind(rgb, d, ocr_state=self.ocr)
         if fr.ok and fr.speed is not None:
             self.bad = 0
+            if self.side is None:                 # 真读出结果了才锁侧别，之后只搜这一侧
+                self.side = "右" if d.cx >= w / 2.0 else "左"
         else:
             self.bad += 1
             if self.bad >= RELOCATE_BAD:      # 一直读不出来：多半是定位错了（或界面切走又切回）
