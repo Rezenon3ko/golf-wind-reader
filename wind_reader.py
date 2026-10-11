@@ -1069,7 +1069,8 @@ def _find_text_lines(rgb: np.ndarray, dial: Dial,
     return boxes
 
 
-def ocr_speed(rgb: np.ndarray, dial: Dial, state: OcrState | None = None) -> dict:
+def ocr_speed(rgb: np.ndarray, dial: Dial, state: OcrState | None = None,
+              allow=None) -> dict:
     """识别风盘附近的 "Nm/s" 数字：切出文字行，用字形模板库匹配。
 
     返回 dict(value, raw, conf, box, ok)；模板库为空、不够有把握、或读出的数值
@@ -1077,15 +1078,19 @@ def ocr_speed(rgb: np.ndarray, dial: Dial, state: OcrState | None = None) -> dic
 
     reject 字段记着"本来读成了多少"，专供排查：读成 35 m/s 这种明显不可能的，
     既不算数，也得留下证据（调用方会因此存一帧图）。
+
+    allow 给定时只用它筛数值 —— 调用方已经知道箭头颜色时，可以把风速框死在那条
+    颜色对应的区间里（箭头是大块纯色，比细笔画数字可靠得多）。
     """
     state = state or _DEFAULT_OCR
+    ok_val = allow or (lambda v: 0 <= v <= MAX_WIND)
     res = dict(value=None, raw="", conf=0.0, box=None, ok=False, reject=None)
     # 候选文字行按面积从大到小依次试，第一个匹配上的就是风速
     for roi in _find_text_lines(rgb, dial):
         x0, y0, x1, y1 = roi
         res["box"] = [x0, y0, x1, y1]
         crop = Image.fromarray(rgb[y0:y1, x0:x1])
-        tm = match_glyphs(crop, state=state, accept=lambda v: 0 <= v <= MAX_WIND)
+        tm = match_glyphs(crop, state=state, accept=ok_val)
         if tm is None:
             bad = match_glyphs(crop, state=state)      # 只是一探：记下"读成了什么"供排查
             if bad is not None:
@@ -1408,9 +1413,36 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
     ss = max(1, int(supersample or SUPERSAMPLE))
     band = wind_color(fr.speed)          # 先有风速，才知道箭头该是什么颜色
     arrow = measure_arrow(rgb, hsv, dial, supersample=ss, band=band)
+    mismatch = False
+    if arrow is None and band is not None and do_ocr:
+        # 这一档的箭头没找到 → 探一下盘里是不是"另一种颜色"的箭头。
+        # 箭头是盘里最大的一块纯色，比那两三个细笔画数字可靠得多：如果它是别的颜色，
+        # 几乎可以断定**数字读错了** —— 例如 6m/s 读成 5，于是拿 1-5 的青带去抓
+        # 黄色箭头，当然抓不到，窗口就报"彩色箭头未找到"。这时按该颜色对应的风速
+        # 区间把数字重读一遍，数字和颜色就自洽了。
+        for lo, hi, _name, (h0, h1), smin, vmin in WIND_COLORS:
+            full = (h0, h1, smin, vmin)          # 和 wind_color() 返回的是同一种四元组
+            if full == band:                     # 这条刚试过，跳过
+                continue
+            alt = measure_arrow(rgb, hsv, dial, supersample=ss, band=full)
+            if alt is None:
+                continue
+            mismatch = True
+            ocr2 = ocr_speed(rgb, dial, state=ocr_state,
+                             allow=lambda v, lo=lo, hi=hi: lo <= v <= hi)
+            if ocr2.get("value") is not None:
+                fr.ocr = ocr2
+                fr.speed = float(ocr2["value"])
+                band = wind_color(fr.speed)
+                arrow = alt
+            break
     if arrow is None:
-        fr.message = ("风速对应的彩色箭头未找到（可能数字读错或不在瞄准界面）"
-                      if band is not None else "风盘内未找到风箭头")
+        if mismatch:
+            fr.message = "箭头颜色与风速数字对不上（数字读错？）"
+        elif band is not None:
+            fr.message = "风速对应的彩色箭头未找到（可能数字读错或不在瞄准界面）"
+        else:
+            fr.message = "风盘内未找到风箭头"
         return fr
     k = dial.k
     theta = apparent_to_true(arrow.phi, k)
