@@ -9,6 +9,7 @@ NSS 高尔夫风向 —— 桌面悬浮窗（Tkinter）
     python3 overlay.py --alpha 0.5        # 更透明（默认 0.5）
 
 操作：**拖动窗口**移动；**右键 → 退出**。
+第三行是「横风 × 系数 = 结果」：点输入框填系数，结果随识别结果实时变（横风未知时显示 —）。
 日志和诊断图放在程序旁边的「NSSR日志」文件夹里（exe / .app 同级）：
 nssr-overlay.log、nssr-fail-*.jpg。
 
@@ -136,6 +137,7 @@ BG = "#15171c"
 FG = "#f2f4f7"
 DIM = "#8b93a1"
 ERR = "#ff6b6b"
+ENT_BG = "#0e1014"     # 系数输入框的底：比窗口底色再深一点，看着像个"槽"
 PAD = 0                        # 左右留白；0 = 窗口宽度就是第一行的宽度（第二行字小，顶不出窗口）
 # 风向箭头：按真实夹角 θ（0=正前，顺时针）取 8 向
 ARROWS8 = "↑↗→↘↓↙←↖"
@@ -478,7 +480,27 @@ class Overlay:
         self.l_lon = tk.Label(self.row, text="", font=self.font, bg=BG, fg=DIM)
         self.l_lon.pack(side="left", padx=(GAP, 0))
 
-        # 宽度以第一行为准（第一行居中，左右各留 PAD）；高度取两行的自然高度。
+        # 第三行：横风 × 系数 = 结果。系数自己填（输入框），结果实时算。
+        self.calc = tk.Frame(self.root, bg=BG)
+        self.calc.pack(padx=PAD, pady=(0, 8))
+        self.l_mul = tk.Label(self.calc, text="*", font=self.font, bg=BG, fg=DIM)
+        self.l_mul.pack(side="left")
+        self.coef = tk.StringVar(value="1")
+        self.ent = tk.Entry(self.calc, textvariable=self.coef, width=4, justify="center",
+                            font=self.font, bg=ENT_BG, fg=FG, insertbackground=FG,
+                            relief="flat", bd=0, highlightthickness=0)
+        self.ent.pack(side="left", padx=(GAP, 0))
+        self.l_eq = tk.Label(self.calc, text="=", font=self.font, bg=BG, fg=DIM)
+        self.l_eq.pack(side="left", padx=(GAP, 0))
+        self.l_prod = tk.Label(self.calc, text="—", font=self.font, bg=BG, fg=DIM)
+        self.l_prod.pack(side="left", padx=(GAP, 0))
+        self.lat_now: float | None = None              # 当前横风（绝对值），来自识别结果
+        self.coef.trace_add("write", lambda *_: self._calc())     # 改系数立刻重算
+        self.ent.bind("<Button-1>", self._focus_ent)              # 无边框窗口要主动要焦点才能打字
+        self.ent.bind("<FocusIn>", lambda e: self.ent.selection_range(0, "end"))
+        self.ent.bind("<Return>", lambda e: self.root.focus_set())
+
+        # 宽度以第一行为准（第一行居中，左右各留 PAD）；高度取各行的自然高度。
         # 尺寸定死，文字变长也不会跑出屏幕。
         self.win_w = self.win_h = 0
         labs = (self.l_wind, self.l_ang, self.l_lat, self.l_lon)
@@ -486,9 +508,10 @@ class Overlay:
             for lab, txt in zip(labs, sample):
                 lab.config(text=txt)
             self.root.update_idletasks()
-            # 宽度以第一行为准；第二行万一更宽也只补到不叠字为止
+            # 宽度以第一行为准；第二/三行万一更宽也只补到不叠字为止
             self.win_w = max(self.win_w, self.head.winfo_reqwidth() + 2 * PAD,
-                             self.row.winfo_reqwidth() + 2 * PAD)
+                             self.row.winfo_reqwidth() + 2 * PAD,
+                             self.calc.winfo_reqwidth() + 2 * PAD)
             self.win_h = max(self.win_h, self.root.winfo_reqheight())
         self.win_w, self.win_h = max(self.win_w, 200), max(self.win_h, 60)   # 兜底
         self.text_px = max(80, self.win_w - 2 * PAD - 6)   # 第一行提示可用的像素宽
@@ -499,7 +522,9 @@ class Overlay:
         self.l_lon.config(text="")
 
         widgets = (self.root, self.head, self.l_wind, self.l_ang,
-                   self.row, self.l_lat, self.l_lon)
+                   self.row, self.l_lat, self.l_lon,
+                   self.calc, self.l_mul, self.l_eq, self.l_prod)
+        self._dx = self._dy = None
         for w in widgets:                             # 拖动
             w.bind("<Button-1>", self._press)
             w.bind("<B1-Motion>", self._drag)
@@ -510,6 +535,8 @@ class Overlay:
         for w in widgets:                             # 右键（macOS 用 Button-2）
             w.bind("<Button-3>", self._popup)
             w.bind("<Button-2>", self._popup)
+        for seq in ("<Button-3>", "<Button-2>"):      # 输入框也给右键菜单，但不参与拖动
+            self.ent.bind(seq, self._popup)
 
         self._place()
         Reader(self.q, self.stop).start()
@@ -527,10 +554,34 @@ class Overlay:
 
     # ---- 拖动 ----
     def _press(self, e) -> None:
+        if e.widget is self.ent:                      # 点输入框是要打字/选字，别把窗口拖走
+            self._dx = self._dy = None
+            return
         self._dx, self._dy = e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y()
 
     def _drag(self, e) -> None:
+        if self._dx is None:                          # 刚才按在输入框上，不当拖动
+            return
         self.root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
+
+    def _focus_ent(self, e=None) -> None:
+        """无边框置顶窗口不会自动拿键盘焦点：点一下输入框要主动要焦点，否则打不了字。"""
+        try:
+            self.root.after(1, self.ent.focus_force)
+        except Exception:
+            pass
+
+    def _calc(self) -> None:
+        """算「横风 × 系数」：系数不是数字、或还没识别到横风时显示 —。"""
+        try:
+            k = float(self.coef.get().strip())
+        except Exception:
+            k = None
+        if k is None or self.lat_now is None:
+            self.l_prod.config(text="—", fg=DIM)
+            return
+        v = abs(self.lat_now) * k
+        self.l_prod.config(text=f"{v:.2f}", fg=speed_color(abs(v)))
 
     def _popup(self, e) -> None:
         # 记下菜单占的屏幕区域：Windows 上菜单被销毁后那块常常不会被重画，留个白框。
@@ -588,12 +639,16 @@ class Overlay:
                               fg=speed_color(w["lateral_abs"]), font=self.font)
             self.l_lon.config(text=f"{LON_ARROW.get(w['longitudinal_dir'], '·')}  {w['longitudinal_abs']:.2f}",
                               fg=speed_color(w["longitudinal_abs"]), font=self.font)
+            self.lat_now = w["lateral_abs"]           # 横风 → 给下面的乘法器用
+            self._calc()
 
     def _line1(self, text: str, color: str) -> None:
         """
         提示/报错：目标是**整句都看得见**，所以先缩字号、再考虑加宽，最后才截断。
         """
         font, line1, line2, w = self._fit_error(text)
+        self.lat_now = None                           # 提示状态下横风是未知的 → 乘法结果显示 —
+        self._calc()
         self.l_wind.config(text=line1, fg=color, font=font)
         self.l_ang.config(text="")
         self.l_ang.pack_configure(padx=0)                 # 夹角为空时不占位，才会真正居中
