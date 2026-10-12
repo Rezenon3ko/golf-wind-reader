@@ -443,6 +443,8 @@ class Reader(threading.Thread):
 # 悬浮窗
 # --------------------------------------------------------------------------
 class Overlay:
+    COEF_DIGITS = 4              # 系数最多 4 位数字：第一位整数 + 最多 3 位小数（1.999 够用）
+
     def __init__(self, args):
         self.q: queue.Queue = queue.Queue()
         self.stop = threading.Event()
@@ -486,7 +488,9 @@ class Overlay:
         self.coef = tk.StringVar(value="1")
         self.ent = tk.Entry(self.calc, textvariable=self.coef, width=4, justify="center",
                             font=self.font, bg=ENT_BG, fg=FG, insertbackground=FG,
-                            relief="flat", bd=0, highlightthickness=0)
+                            relief="flat", bd=0, highlightthickness=0,
+                            validate="key",
+                            validatecommand=(self.root.register(self._coef_ok), "%P"))
         self.ent.pack(side="left", padx=(GAP, 0))
         self.l_eq = tk.Label(self.calc, text="=", font=self.font, bg=BG, fg=DIM)
         self.l_eq.pack(side="left", padx=(GAP, 0))
@@ -572,16 +576,29 @@ class Overlay:
             pass
 
     def _calc(self) -> None:
-        """算「横风 × 系数」：系数不是数字、或还没识别到横风时显示 —。"""
-        try:
-            k = float(self.coef.get().strip())
-        except Exception:
-            k = None
+        """
+        算「横风 × 系数」。
+
+        系数框**只收数字**，且约定：**第一位是整数、剩下的都当小数**（见 _coef_value）。
+        这样不用打小数点，数字小键盘点几下就完事；空框或还没识别到横风时显示 —。
+        """
+        k = self._coef_value()
         if k is None or self.lat_now is None:
             self.l_prod.config(text="—", fg=DIM)
             return
         v = abs(self.lat_now) * k
         self.l_prod.config(text=f"{v:.2f}", fg=speed_color(abs(v)))
+
+    def _coef_value(self) -> float | None:
+        """系数框里的数字 → 数值：第一位整数、其余小数（115 → 1.15、85 → 0.85、8 → 8）。"""
+        s = self.coef.get().strip()
+        if not s or not s.isdigit():
+            return None
+        return int(s) / (10 ** (len(s) - 1))
+
+    def _coef_ok(self, proposed: str) -> bool:
+        """输入校验：只放数字，最多 COEF_DIGITS 位（第一位整数 + 后面几位小数）。"""
+        return proposed == "" or (proposed.isdigit() and len(proposed) <= self.COEF_DIGITS)
 
     def _popup(self, e) -> None:
         # 记下菜单占的屏幕区域：Windows 上菜单被销毁后那块常常不会被重画，留个白框。
