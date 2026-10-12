@@ -290,6 +290,46 @@ def arrow_mask_band(hsv: np.ndarray, band: tuple[float, float, float, float]) ->
     return (H >= h0) & (H <= h1) & (S >= smin) & (V >= vmin)
 
 
+def wind_range(band: tuple[float, float, float, float]) -> tuple[int, int]:
+    """色带 → 该档的风速区间（1-5 青 / 6-10 黄 / 11-15 品红）。"""
+    for lo, hi, _name, (h0, h1), smin, vmin in WIND_COLORS:
+        if (h0, h1, smin, vmin) == tuple(band):
+            return int(lo), int(hi)
+    return 1, MAX_WIND
+
+
+def _dial_box(dial: Dial, shape, pad_frac: float = 0.35) -> tuple[int, int, int, int]:
+    """风盘（往外放一点）在画面里的裁剪框。"""
+    pad = dial.r * pad_frac
+    return (int(max(dial.cx - dial.r - pad, 0)), int(max(dial.cy - dial.r - pad, 0)),
+            int(min(dial.cx + dial.r + pad, shape[1])),
+            int(min(dial.cy + dial.r + pad, shape[0])))
+
+
+def detect_arrow_band(rgb: np.ndarray, dial: Dial,
+                      min_px: int = 100) -> tuple[float, float, float, float] | None:
+    """
+    看风盘里那支箭头是什么颜色 ⇒ 风速在哪一档（1-5 青 / 6-10 黄 / 11-15 品红）。
+
+    箭头是盘里最大的一块纯色，比那两三个细笔画数字可靠得多。先用它把风速框进 5 档，
+    再让数字在窄范围里认 —— "6 读成 5"这种跨档误读从源头上就不会发生。
+    三色像素都不够（没在瞄准界面 / 箭头被挡住）就返回 None，调用方走原来的全范围流程。
+    """
+    x0, y0, x1, y1 = _dial_box(dial, rgb.shape)
+    if x1 - x0 < 10 or y1 - y0 < 10:
+        return None
+    hsv = rgb_to_hsv(rgb[y0:y1, x0:x1])
+    yy, xx = np.mgrid[0:hsv.shape[0], 0:hsv.shape[1]]
+    inside = ((xx - (dial.cx - x0)) ** 2 + (yy - (dial.cy - y0)) ** 2) <= (0.97 * dial.r) ** 2
+    best_n, best_band = 0, None
+    for _lo, _hi, _name, (h0, h1), smin, vmin in WIND_COLORS:
+        n = int(((hsv[..., 0] >= h0) & (hsv[..., 0] <= h1)
+                 & (hsv[..., 1] >= smin) & (hsv[..., 2] >= vmin) & inside).sum())
+        if n > best_n:
+            best_n, best_band = n, (h0, h1, smin, vmin)
+    return best_band if best_n >= min_px else None
+
+
 # --------------------------------------------------------------------------
 # 2. 风盘定位
 # --------------------------------------------------------------------------
@@ -1428,11 +1468,29 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
     do_ocr=False 表示本次不读风速（沿用调用方给的 speed）。
     """
     fr = FrameReading(dial=dial)
+    ss = max(1, int(supersample or SUPERSAMPLE))
     if speed is None and do_ocr:
-        ocr = ocr_speed(rgb, dial, state=ocr_state)
-        fr.ocr = ocr
-        if ocr.get("value") is not None:
-            speed = float(ocr["value"])
+        # ① 先看箭头颜色 ⇒ 风速在哪一档，再让数字在这个窄范围里认。
+        #    箭头是盘里最大的一块纯色，比细笔画数字可靠；这样"6 读成 5"这种
+        #    跨档误读从源头上就不会发生（5 直接不在候选里）。
+        band_hint = detect_arrow_band(rgb, dial)
+        if band_hint is not None:
+            lo, hi = wind_range(band_hint)
+
+            def in_band(v, lo=lo, hi=hi):
+                return lo <= v <= hi
+
+            ocr = ocr_speed(rgb, dial, state=ocr_state, allow=in_band)
+            if ocr.get("value") is None:            # 严格判据没过 → 在该档里挑最像的
+                ocr = ocr_speed(rgb, dial, state=ocr_state, allow=in_band, best_effort=True)
+            fr.ocr = ocr
+            if ocr.get("value") is not None:
+                speed = float(ocr["value"])
+        if speed is None:                           # 没看出颜色 / 这一档读不出 → 老的全区间读法
+            ocr = ocr_speed(rgb, dial, state=ocr_state)
+            fr.ocr = ocr
+            if ocr.get("value") is not None:
+                speed = float(ocr["value"])
     if speed is None:
         fr.message = "风速未识别（等待下一次读取）"
         return fr
@@ -1441,7 +1499,6 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
         fr.ok, fr.no_wind, fr.speed = True, True, 0.0
         fr.message = "风速 0 m/s —— 无风，按规则跳过计算"
         return fr
-    ss = max(1, int(supersample or SUPERSAMPLE))
     band = wind_color(fr.speed)          # 先有风速，才知道箭头该是什么颜色
     arrow = measure_arrow(rgb, hsv, dial, supersample=ss, band=band)
     mismatch = False
