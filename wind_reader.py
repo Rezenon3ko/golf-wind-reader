@@ -324,9 +324,12 @@ def _in_gauge_zone(cx: float, cy: float, shape, side: str | None = None) -> bool
 
     side 给定时只认那一侧 —— 玩家一局之内不会换手，锁定侧别可以彻底避免
     "在对侧误抓一个白色 UI 当风盘"（那种情况下会一直报"风速未识别"）。
+
+    cy 限在 27% 以内：小地图右下角那个"风速徽章"长得跟风盘一模一样（白圈 + 箭头 +
+    Nm/s），位置就在 30% 上下 —— 之前它会被当成风盘，读的是小地图上的数字。
     """
     h, w = shape[:2]
-    if cy > 0.30 * h:
+    if cy > 0.27 * h:
         return False
     if side == "右":
         return cx >= 0.70 * w
@@ -723,7 +726,11 @@ def find_dials(rgb: np.ndarray, hsv: np.ndarray | None = None,
                     and fit.get("rms", 9) < 0.6 and fit.get("n", 0) >= 40
                     and 0.72 <= (fit["a"] / CONFIG.disc_panel_ratio) / max(d.r, 1) <= 1.30):
                 d.k = float(fit["k"])
-    return merged
+    # 风盘整个都在画面里（贴边被裁掉一半的圆环不是风盘 —— 之前会把画面边缘的
+    # 白色 UI 当成风盘，读出来一串乱七八糟的数字）
+    return [d for d in merged
+            if (d.cx - d.r >= -0.05 * d.r and d.cx + d.r <= img_w + 0.05 * d.r
+                and d.cy - d.r >= -0.05 * d.r and d.cy + d.r <= img_h + 0.05 * d.r)]
 
 
 # --------------------------------------------------------------------------
@@ -1064,13 +1071,18 @@ def _find_text_lines(rgb: np.ndarray, dial: Dial,
         Y0 = min(c.y0 for c in line); Y1 = max(c.y1 for c in line)
         anchor = max(line, key=lambda c: c.area)
         pad = max(4, int(0.12 * anchor.h))
-        boxes.append((max(X0 + x0 - pad, 0), max(Y0 + y0 - pad, 0),
-                      min(X1 + x0 + pad, img_w), min(Y1 + y0 + pad, img_h)))
+        box = (max(X0 + x0 - pad, 0), max(Y0 + y0 - pad, 0),
+               min(X1 + x0 + pad, img_w), min(Y1 + y0 + pad, img_h))
+        # "Nm/s" 那行的高度是固定的（约 0.3·r）。太高的框多半是把别的东西圈进来了 ——
+        # 例如小地图上的地形/徽章，读出来的"数字"根本不是风速。
+        bh = box[3] - box[1]
+        if 0.18 * r <= bh <= 0.50 * r:
+            boxes.append(box)
     return boxes
 
 
 def ocr_speed(rgb: np.ndarray, dial: Dial, state: OcrState | None = None,
-              allow=None) -> dict:
+              allow=None, best_effort: bool = False) -> dict:
     """识别风盘附近的 "Nm/s" 数字：切出文字行，用字形模板库匹配。
 
     返回 dict(value, raw, conf, box, ok)；模板库为空、不够有把握、或读出的数值
@@ -1090,7 +1102,7 @@ def ocr_speed(rgb: np.ndarray, dial: Dial, state: OcrState | None = None,
         x0, y0, x1, y1 = roi
         res["box"] = [x0, y0, x1, y1]
         crop = Image.fromarray(rgb[y0:y1, x0:x1])
-        tm = match_glyphs(crop, state=state, accept=ok_val)
+        tm = match_glyphs(crop, state=state, accept=ok_val, best_effort=best_effort)
         if tm is None:
             bad = match_glyphs(crop, state=state)      # 只是一探：记下"读成了什么"供排查
             if bad is not None:
@@ -1098,7 +1110,7 @@ def ocr_speed(rgb: np.ndarray, dial: Dial, state: OcrState | None = None,
             continue
         val = int(tm[0])
         # match_glyphs 已保证"绝对分 ≥0.60 且与次高差 ≥0.10"，这里只兜游戏范围的上下限
-        if 0 <= val <= MAX_WIND and tm[1] >= 0.60:
+        if ok_val(val) and tm[1] >= (0.45 if best_effort else 0.60):
             res.update(value=val, raw=f"tpl:{tm[0]}", conf=tm[1], ok=True)
             return res
     return res
@@ -1253,7 +1265,8 @@ def _glyph_windows(crop: Image.Image, max_digits: int = 2,
 
 def match_glyphs(crop: Image.Image,
                  state: OcrState | None = None,
-                 accept=None) -> tuple[str, float] | None:
+                 accept=None,
+                 best_effort: bool = False) -> tuple[str, float] | None:
     """
     用模板库识别数字部分。返回 (数字串, 置信度)；库为空或匹配太弱返回 None。
 
@@ -1262,20 +1275,28 @@ def match_glyphs(crop: Image.Image,
 
     accept 是可选的数值校验：不通过就换下一组窗口再试。用来挡掉"3m/s 被凑成 35"
     这种 —— 2 位数先试，凑出来的值超出游戏范围就直接作废，回头还能认出正确的那一位。
+
+    best_effort=True 时，如果一组都没通过上面的严格判据，就退一步：**只在 accept
+    允许的数字里**挑分最高的那个（门槛也放低）。用在"箭头颜色已经告诉我们风速在哪一档"
+    的时候 —— 例如黄色箭头 ⇒ 只能是 6~10，那么 5 就被排除在外，剩下的候选里 6 通常
+    就是最高分，能把"6 读成 5"救回来。
     """
     bank = (state or _DEFAULT_OCR).bank
     if not bank:
         return None
     band = _line_band(_bin_white(crop))      # 行基准：所有字形共用同一套上下沿
+    fallback: tuple[float, str] | None = None
     for win in _glyph_windows(crop):
         out, worst = "", 1.0
+        alt_out, alt_worst = "", 1.0
         for a, b in win:
             g = _glyph_norm(crop.crop((a, 0, b, crop.height)), band)
             if g is None:
                 break
-            best, second = 0.0, 0.0
-            digit = ""
+            best, second, digit = 0.0, 0.0, ""
+            best_ok, digit_ok = 0.0, ""
             for d, temps in bank.items():
+                allowed = accept is None or accept(int(d))
                 for t in temps:
                     sc = _glyph_sim(g, t)
                     if sc > best:
@@ -1283,6 +1304,11 @@ def match_glyphs(crop: Image.Image,
                         best, digit = sc, d
                     else:
                         second = max(second, sc)
+                    if allowed and sc > best_ok:
+                        best_ok, digit_ok = sc, d
+            if best_ok > 0:
+                alt_out += digit_ok
+                alt_worst = min(alt_worst, best_ok)
             # 判据是"差距"，不是绝对分：
             #   "1" 这种细笔画的字，绝对相似度天生上不去（归一化后差几个像素，IoU 掉一大截，
             #   实测干净切出来的 "1" 也只有 0.66），但它跟第二名的差距极大（0.66 vs 0.45）。
@@ -1295,6 +1321,11 @@ def match_glyphs(crop: Image.Image,
         else:
             if accept is None or accept(int(out)):
                 return out, worst           # 整组都匹配上、数值也合理，才算数
+        if best_effort and len(alt_out) == len(win) and alt_worst >= 0.45:
+            if fallback is None or alt_worst > fallback[0]:
+                fallback = (alt_worst, alt_out)
+    if fallback is not None:
+        return fallback[1], fallback[0]
     return None
 
 
@@ -1429,7 +1460,8 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
                 continue
             mismatch = True
             ocr2 = ocr_speed(rgb, dial, state=ocr_state,
-                             allow=lambda v, lo=lo, hi=hi: lo <= v <= hi)
+                             allow=lambda v, lo=lo, hi=hi: lo <= v <= hi,
+                             best_effort=True)
             if ocr2.get("value") is not None:
                 fr.ocr = ocr2
                 fr.speed = float(ocr2["value"])
