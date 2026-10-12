@@ -128,6 +128,7 @@ def _migrate_old_artifacts() -> None:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import obs_live_wind_reader as O          # 复用取帧（ObsWebSocketSource）与识别（Recognizer）
+from version import __version__ as APP_VERSION   # 版本号唯一来源（打包脚本读的是同一个文件）
 
 
 # --------------------------------------------------------------------------
@@ -203,7 +204,7 @@ class Reader(threading.Thread):
         src = rec = None
         backoff = 3.0                             # 连不上时的重试间隔（失败就翻倍，最长 30 秒）
         _migrate_old_artifacts()                  # 旧版摊在 exe 那层的日志/截图先收进子文件夹
-        self._log(f"启动：{sys.platform} / Python {sys.version.split()[0]} / "
+        self._log(f"启动：v{APP_VERSION} / {sys.platform} / Python {sys.version.split()[0]} / "
                   f"{O.FPS:g} 次每秒 / 日志 {os.path.join(_artifact_dir(), 'nssr-overlay.log')}")
         self._prune_dumps()                       # 旧诊断图超预算先清掉（含旧版本留下的 .png）
         while not self.stop.is_set():
@@ -529,6 +530,8 @@ class Overlay:
             w.bind("<Button-1>", self._press)
             w.bind("<B1-Motion>", self._drag)
         self.menu = tk.Menu(self.root, tearoff=0)
+        self.menu.add_command(label=f"NSSR风向识别 v{APP_VERSION}", state="disabled")
+        self.menu.add_separator()
         self.menu.add_command(label="退出", command=self.quit)
         self._menu_at: tuple[int, int, int, int] | None = None   # 菜单弹出时占的屏幕区域（退出时要擦掉）
         self._quitting = False

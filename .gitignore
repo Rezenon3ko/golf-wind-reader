@@ -15,3 +15,5 @@ __pycache__/
 NSSR日志/
 nssr-overlay.log*
 nssr-fail-*
+# 字形库总览图（排查用，随手生成）
+glyph_bank_preview.png
