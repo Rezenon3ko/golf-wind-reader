@@ -91,11 +91,9 @@ RELOCATE_BAD = 6                   # 连续这么多帧读不出来就丢掉缓�
 HYST = 0.05                        # 横向/纵向 |值| 小于它就沿用上一次方向（0 附近不抖）
 FLIP_CONF = 0.6                    # 方向置信度低于此值时才做反 180° 保护
 FLIP_RUN = 3                       # 连续这么多次"反向"才认为真的转向了
-STEADY_DEG = 2.5                   # 最近几拍角度都在这个跨度内 → 判定画面静止（实测静止抖动 0.6~1.4°）
-STEADY_MIN = 3                     # 至少攒这么多拍才开始锁定
-STEADY_N = 5                       # 参与平均的最近读数个数（2 次/秒 → 约 2.5 秒）
-RELEASE_DEG = 3.0                  # 离锁定值超过它、且连续 RELEASE_RUN 拍 → 解锁（真的转了）
-RELEASE_RUN = 2                    # 连续两拍才解锁：单拍跳一下不放开，免得显示又抖起来
+SMOOTH_A = 0.35                    # 角度指数平滑系数：越小越稳、越大越跟手（0.35 → 约 3 拍时间常数）
+SMOOTH_JUMP = 5.0                  # 单拍变化超过它：连着两拍 = 真在转（直通），只一拍 = 测歪了（丢弃）
+SMOOTH_STEP = 0.7                  # 显示死区：EMA 偏离当前显示值超过它才更新 —— 静止时显示纹丝不动
 
 
 # ==========================================================================
@@ -409,9 +407,9 @@ class Recognizer:
         self.last_theta: float | None = None
         self.flip_run = 0                # 连续"反向"次数
         self.last_dir: dict[str, str] = {}   # 横向/纵向上一次的方向（做迟滞用）
-        self.recent: list[float] = []    # 最近几拍的真实夹角（做"静止取平均"用）
-        self.held: float | None = None   # 静止时"定住"的输出角度
-        self.out_run = 0                 # 连续几拍明显偏离锁定值（达到 RELEASE_RUN 才解锁）
+        self.ema: float | None = None    # 角度指数平滑值（压抖动）
+        self.shown: float | None = None  # 当前显示的角度（带死区，静止时不动）
+        self.turn_run = 0                # 连续几拍大幅变化（≥2 判定为真在转视角）
         self.ocr = W.OcrState()          # 字形模板库状态独立
         n = W.load_glyph_bank(GLYPH_BANK, state=self.ocr)
         if not n:
@@ -439,7 +437,7 @@ class Recognizer:
     def reset(self) -> None:
         """丢掉缓存的定位（保留左右手锁定），下帧重新找 —— 识别出错时用。"""
         self.dial, self.shape, self.bad = None, None, 0
-        self.recent.clear()
+        self.ema = self.shown = None
 
     def recognize(self, rgb) -> dict:
         t0 = time.time()
@@ -464,7 +462,7 @@ class Recognizer:
             self.bad += 1
             if self.bad >= RELOCATE_BAD:      # 一直读不出来：多半是定位错了（或界面切走又切回）
                 self.dial, self.side, self.bad = None, None, 0   # 清缓存，下帧重新定位+重判左右
-                self.recent.clear()
+                self.ema = self.shown = None
                 if self.args.verbose:
                     print("\n[定位] 连续读不出来 → 丢弃缓存，重新定位")
         if fr.ocr is not None and fr.ocr.get("value") is None and self.args.verbose:
@@ -492,37 +490,49 @@ class Recognizer:
     # ---- 抖动抑制：静止时取平均并定住 ----
     def _steady_theta(self, theta: float) -> float:
         """
-        画面不动时，风向箭头每拍仍有 0.6~1.4° 的测量噪声（实机测的），横风经系数
-        放大后就能看出在跳。这里做**"锁定-保持"**：
+        抖动抑制：实机测静止时角度每拍抖 0.6~2.0°（横风经系数放大后就看得出在跳），
+        但手柄微调方向时每拍只挪零点几度 —— 两者必须分开对待。
 
-          · 未锁定：最近 STEADY_N 拍角度跨度 ≤ STEADY_DEG → 取这几拍的圆周平均**锁定**；
-          · 已锁定：输出**一直不动**（这才是"定住"），忽略期间所有小抖动；
-          · 解锁条件很严格：**连续 RELEASE_RUN 拍**都离锁定值超过 RELEASE_DEG 才放开 ——
-            单拍跳一下不理会，免得显示又跟着抖。转视角时每拍动好几度，两拍就解锁，
-            所以照样跟手（解锁后立刻用原始值显示）。
+        做法（三步，按优先级）：
+          ① **快转直通**：连续两拍都变化 > SMOOTH_JUMP → 认定真的在转视角，输出原始值，
+             不平滑（保证跟手）；
+          ② **单拍大跳丢弃**：只有一拍变化很大 → 多半是这一帧箭头测歪了，丢掉它，
+             保持上一拍的显示（免得显示被一帧噪声带跳）；
+          ③ **EMA + 显示死区**：正常情况用指数平均压噪声（σ 从 ~0.5° 压到 ~0.2°），
+             再要求"EMA 偏离显示值 > SMOOTH_STEP 才更新显示" —— 于是静止时显示纹丝不动，
+             而微调造成的是**持续偏移**，EMA 会跟过去、显示每隔一小会儿挪一格，能跟上。
         """
-        if self.held is not None:
-            if self._ang_diff(theta, self.held) > RELEASE_DEG:
-                self.out_run += 1
-                if self.out_run >= RELEASE_RUN:          # 连续两拍明显偏开 → 真的转了
-                    self.held, self.out_run, self.recent = None, 0, []
-            else:
-                self.out_run = 0
-            if self.held is not None:
-                return self.held                         # 锁定期间输出纹丝不动
-        self.recent.append(theta)
-        if len(self.recent) > STEADY_N:
-            self.recent.pop(0)
-        if len(self.recent) >= STEADY_MIN and self._ang_span(self.recent) <= STEADY_DEG:
-            self.held = self._circ_mean(self.recent) % 360.0   # 与原始 θ 一样用 0~360 口径
-            self.out_run = 0
-            return self.held
-        return theta
+        if self.ema is None:
+            self.ema = self.shown = theta
+            return theta
+        d = self._ang_diff(theta, self.ema)
+        self.turn_run = self.turn_run + 1 if d > SMOOTH_JUMP else 0
+        if self.turn_run >= 2:                       # ① 真的在转 → 直通
+            self.ema = self.shown = theta
+            return theta
+        if d > SMOOTH_JUMP:                          # ② 单拍跳变 → 丢弃这一拍
+            return self.shown
+        dd = ((theta - self.ema + 180.0) % 360.0) - 180.0
+        self.ema = (self.ema + SMOOTH_A * dd) % 360.0
+        if self._ang_diff(self.ema, self.shown) > SMOOTH_STEP:   # ③ 死区：挪够了才改显示
+            self.shown = self.ema
+        return self.shown
 
     @staticmethod
     def _ang_diff(a: float, b: float) -> float:
         """两个角度之间的最小夹角（度，0~180）。"""
         return abs(((a - b + 180.0) % 360.0) - 180.0)
+
+    @staticmethod
+    def _circ_median(deg: list[float]) -> float:
+        """
+        圆周中位数：以圆周均值为参考取偏差的中位数。
+
+        比均值抗单帧跳变 —— 某一拍测歪 8°，均值会被拽走 1~2°，中位数几乎不动。
+        """
+        m = Recognizer._circ_mean(deg)
+        devs = sorted(((d - m + 180.0) % 360.0) - 180.0 for d in deg)
+        return (m + devs[len(devs) // 2]) % 360.0
 
     @staticmethod
     def _circ_mean(deg: list[float]) -> float:
