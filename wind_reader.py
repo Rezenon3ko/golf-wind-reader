@@ -325,13 +325,16 @@ def _dial_box(dial: Dial, shape, pad_frac: float = 0.35) -> tuple[int, int, int,
 
 
 def detect_arrow_band(rgb: np.ndarray, dial: Dial,
-                      min_px: int = 100) -> tuple[float, float, float, float] | None:
+                      min_px: int = 100,
+                      relax: float = 0.0) -> tuple[float, float, float, float] | None:
     """
     看风盘里那支箭头是什么颜色 ⇒ 风速在哪一档（1-5 青 / 6-10 黄 / 11-15 品红）。
 
     箭头是盘里最大的一块纯色，比那两三个细笔画数字可靠得多。先用它把风速框进 5 档，
     再让数字在窄范围里认 —— "6 读成 5"这种跨档误读从源头上就不会发生。
     三色像素都不够（没在瞄准界面 / 箭头被挡住）就返回 None，调用方走原来的全范围流程。
+
+    relax>0 时把饱和/亮度门槛各降这么多（色相不动）—— 采集卡把颜色洗淡时用，见 _relax_band。
     """
     x0, y0, x1, y1 = _dial_box(dial, rgb.shape)
     if x1 - x0 < 10 or y1 - y0 < 10:
@@ -342,10 +345,24 @@ def detect_arrow_band(rgb: np.ndarray, dial: Dial,
     best_n, best_band = 0, None
     for _lo, _hi, _name, (h0, h1), smin, vmin in WIND_COLORS:
         n = int(((hsv[..., 0] >= h0) & (hsv[..., 0] <= h1)
-                 & (hsv[..., 1] >= smin) & (hsv[..., 2] >= vmin) & inside).sum())
+                 & (hsv[..., 1] >= max(0.10, smin - relax))
+                 & (hsv[..., 2] >= max(0.35, vmin - relax)) & inside).sum())
         if n > best_n:
             best_n, best_band = n, (h0, h1, smin, vmin)
     return best_band if best_n >= min_px else None
+
+
+def _relax_band(band: tuple[float, float, float, float],
+                ds: float = 0.30, dv: float = 0.30) -> tuple[float, float, float, float]:
+    """
+    洗淡兜底用的放宽色带：**色相完全不动，只降饱和/亮度门槛**。
+
+    有的采集卡（尤其采集卡→虚拟机的链路）会把颜色洗淡：色相还是青/黄/品红，
+    但饱和度/亮度掉到门槛下 —— 实测把正常帧往灰里拉 50% 就复现出"风速读得出、
+    箭头找不到（θ=None）"。这种情况下色相判据仍然可靠，放宽 S/V 就能救回来。
+    """
+    h0, h1, smin, vmin = band
+    return (h0, h1, max(0.10, smin - ds), max(0.35, vmin - dv))
 
 
 # --------------------------------------------------------------------------
@@ -1497,6 +1514,8 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
         #    箭头是盘里最大的一块纯色，比细笔画数字可靠；这样"6 读成 5"这种
         #    跨档误读从源头上就不会发生（5 直接不在候选里）。
         band_hint = detect_arrow_band(rgb, dial)
+        if band_hint is None:                       # 颜色被采集卡洗淡时，放宽 S/V 再认一次
+            band_hint = detect_arrow_band(rgb, dial, min_px=60, relax=0.30)
         if band_hint is not None:
             lo, hi = wind_range(band_hint)
 
@@ -1525,6 +1544,10 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
         return fr
     band = wind_color(fr.speed)          # 先有风速，才知道箭头该是什么颜色
     arrow = measure_arrow(rgb, hsv, dial, supersample=ss, band=band)
+    if arrow is None and band is not None:
+        # 采集卡把颜色洗淡时（色相还在、S/V 不达标），先用放宽门槛的同一档色带再试一次，
+        # 再谈"是不是另一种颜色"。实测这就是"风速读得出、箭头找不到"的主因。
+        arrow = measure_arrow(rgb, hsv, dial, supersample=ss, band=_relax_band(band))
     mismatch = False
     if arrow is None and band is not None and do_ocr:
         # 这一档的箭头没找到 → 探一下盘里是不是"另一种颜色"的箭头。
