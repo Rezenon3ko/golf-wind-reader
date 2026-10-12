@@ -91,12 +91,11 @@ RELOCATE_BAD = 6                   # 连续这么多帧读不出来就丢掉缓�
 HYST = 0.05                        # 横向/纵向 |值| 小于它就沿用上一次方向（0 附近不抖）
 FLIP_CONF = 0.6                    # 方向置信度低于此值时才做反 180° 保护
 FLIP_RUN = 3                       # 连续这么多次"反向"才认为真的转向了
-STEADY_DEG = 1.5                   # 最近几拍角度都在这个跨度内 → 判定画面静止
-                                   # （实测静止时抖动 0.6~1.1°，取 1.5° 留余量；转视角每拍动好几度，不受影响）
-STEADY_MIN = 3                     # 至少攒这么多拍才开始取平均
+STEADY_DEG = 2.5                   # 最近几拍角度都在这个跨度内 → 判定画面静止（实测静止抖动 0.6~1.4°）
+STEADY_MIN = 3                     # 至少攒这么多拍才开始锁定
 STEADY_N = 5                       # 参与平均的最近读数个数（2 次/秒 → 约 2.5 秒）
-RELEASE_DEG = 4.0                  # 新读数离平均值超过它 → 认定真转了，立刻放开
-STEADY_STEP = 0.2                  # 静止时输出只在平均值变动超过它才更新（于是显示"定住"）
+RELEASE_DEG = 3.0                  # 离锁定值超过它、且连续 RELEASE_RUN 拍 → 解锁（真的转了）
+RELEASE_RUN = 2                    # 连续两拍才解锁：单拍跳一下不放开，免得显示又抖起来
 
 
 # ==========================================================================
@@ -412,6 +411,7 @@ class Recognizer:
         self.last_dir: dict[str, str] = {}   # 横向/纵向上一次的方向（做迟滞用）
         self.recent: list[float] = []    # 最近几拍的真实夹角（做"静止取平均"用）
         self.held: float | None = None   # 静止时"定住"的输出角度
+        self.out_run = 0                 # 连续几拍明显偏离锁定值（达到 RELEASE_RUN 才解锁）
         self.ocr = W.OcrState()          # 字形模板库状态独立
         n = W.load_glyph_bank(GLYPH_BANK, state=self.ocr)
         if not n:
@@ -492,32 +492,37 @@ class Recognizer:
     # ---- 抖动抑制：静止时取平均并定住 ----
     def _steady_theta(self, theta: float) -> float:
         """
-        画面没动的时候，风向箭头每拍仍有零点几度的测量噪声（实测静止时跨度 ~0.6°、
-        σ≈0.16°），横风经系数放大后就看得出在跳。
+        画面不动时，风向箭头每拍仍有 0.6~1.4° 的测量噪声（实机测的），横风经系数
+        放大后就能看出在跳。这里做**"锁定-保持"**：
 
-        这里做"静止就平均、动起来就立刻放开"：
-          · 最近 STEADY_N 拍的角度跨度 ≤ STEADY_DEG（1°）→ 判为静止，输出它们的圆周平均
-            （平均后噪声只剩 0.07° 量级，显示就定住了）；
-          · 只要新读数离当前平均超过 RELEASE_DEG（4°）→ 判定真的转了，立刻清空重来，
-            所以转视角时不会有任何滞后（不满足静止条件时直接返回原始读数）。
-          · 输出再过一道迟滞（STEADY_STEP）：平均值没挪够 0.2° 就不动显示 —— 否则
-            均值会随窗口滑动一直小幅漂，看起来还是在跳。
+          · 未锁定：最近 STEADY_N 拍角度跨度 ≤ STEADY_DEG → 取这几拍的圆周平均**锁定**；
+          · 已锁定：输出**一直不动**（这才是"定住"），忽略期间所有小抖动；
+          · 解锁条件很严格：**连续 RELEASE_RUN 拍**都离锁定值超过 RELEASE_DEG 才放开 ——
+            单拍跳一下不理会，免得显示又跟着抖。转视角时每拍动好几度，两拍就解锁，
+            所以照样跟手（解锁后立刻用原始值显示）。
         """
-        if self.recent:
-            dev = abs(((theta - self._circ_mean(self.recent) + 180.0) % 360.0) - 180.0)
-            if dev > RELEASE_DEG:
-                self.recent.clear()          # 真转了 → 旧样本作废
-                self.held = None
+        if self.held is not None:
+            if self._ang_diff(theta, self.held) > RELEASE_DEG:
+                self.out_run += 1
+                if self.out_run >= RELEASE_RUN:          # 连续两拍明显偏开 → 真的转了
+                    self.held, self.out_run, self.recent = None, 0, []
+            else:
+                self.out_run = 0
+            if self.held is not None:
+                return self.held                         # 锁定期间输出纹丝不动
         self.recent.append(theta)
         if len(self.recent) > STEADY_N:
             self.recent.pop(0)
         if len(self.recent) >= STEADY_MIN and self._ang_span(self.recent) <= STEADY_DEG:
-            m = self._circ_mean(self.recent) % 360.0      # 与原始 θ 一样用 0~360 口径
-            if self.held is None or abs(((m - self.held + 180.0) % 360.0) - 180.0) > STEADY_STEP:
-                self.held = m
+            self.held = self._circ_mean(self.recent) % 360.0   # 与原始 θ 一样用 0~360 口径
+            self.out_run = 0
             return self.held
-        self.held = None
         return theta
+
+    @staticmethod
+    def _ang_diff(a: float, b: float) -> float:
+        """两个角度之间的最小夹角（度，0~180）。"""
+        return abs(((a - b + 180.0) % 360.0) - 180.0)
 
     @staticmethod
     def _circ_mean(deg: list[float]) -> float:
