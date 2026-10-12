@@ -9,8 +9,9 @@ PyInstaller 打包配置（macOS 独立应用）。用 ./packaging/build_app.sh 
 """
 import os
 
-APP_NAME = "NSSR风向识别"
-BUNDLE_ID = "com.rezenon3ko.nssr-wind-reader"
+# 应用名可用环境变量覆盖（打包测试版时用 NSSR_APP_NAME=test 生成 dist/test.app）
+APP_NAME = os.environ.get("NSSR_APP_NAME", "NSSR风向识别")
+BUNDLE_ID = "com.rezenon3ko.nssr-wind-reader" + ("" if APP_NAME == "NSSR风向识别" else ".test")
 
 ROOT = os.path.abspath(os.path.join(SPECPATH, os.pardir))     # 项目根目录
 
