@@ -444,7 +444,6 @@ class Reader(threading.Thread):
 # --------------------------------------------------------------------------
 class Overlay:
     def __init__(self, args):
-        self.args = args
         self.q: queue.Queue = queue.Queue()
         self.stop = threading.Event()
         self.ok = False
@@ -453,7 +452,6 @@ class Overlay:
         self.root.title("风向")
         self.root.overrideredirect(True)              # 无边框
         self.root.attributes("-topmost", True)        # 置顶
-        self._alpha = args.alpha
         try:
             self.root.attributes("-alpha", args.alpha)  # 半透明
         except Exception:
@@ -463,7 +461,6 @@ class Overlay:
         # 所以截断提示文案必须按真实宽度量（font.measure），靠估算会算少 1/3。
         self._fonts: dict[int, tkfont.Font] = {}      # 字号 → Font（提示要按需缩小，缓存起来别每次新建）
         self.font = self._font_at(HEAD_SIZE)
-        self.font_small = self._font_at(ERROR_SIZE)
 
         # 第一行：风向箭头 + 风速（按档位着色）+ 夹角，整行水平居中
         self.head = tk.Frame(self.root, bg=BG)

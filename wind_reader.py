@@ -290,6 +290,20 @@ def arrow_mask_band(hsv: np.ndarray, band: tuple[float, float, float, float]) ->
     return (H >= h0) & (H <= h1) & (S >= smin) & (V >= vmin)
 
 
+def _grass_mask(rgb: np.ndarray, r_margin: int = 30, b_margin: int = 50,
+                v_min: int = 150) -> np.ndarray:
+    """
+    "草地绿"掩膜。定位的四条路（先验 / 箭头锚点 / 圆盘拟合 / 白环）都要用它。
+
+    以前这式子在 5 个地方各抄了一遍，还抄出 4 套阈值 —— 现在收成一个函数；
+    阈值留成参数是因为各条路历史上分别调过（先验那条略松：25/45/140，
+    白环那条按整帧的绿更杂：15/15/95），改了就得重新测。
+    """
+    a = rgb.astype(np.int16)
+    R, G, B = a[..., 0], a[..., 1], a[..., 2]
+    return (G > R + r_margin) & (G > B + b_margin) & (G > v_min)
+
+
 def wind_range(band: tuple[float, float, float, float]) -> tuple[int, int]:
     """色带 → 该档的风速区间（1-5 青 / 6-10 黄 / 11-15 品红）。"""
     for lo, hi, _name, (h0, h1), smin, vmin in WIND_COLORS:
@@ -450,9 +464,7 @@ def _fit_disc_local(rgb: np.ndarray, cx: float, cy: float, half: int,
     if x1 - x0 < 40 or y1 - y0 < 40:
         return None
     win = rgb[y0:y1, x0:x1]
-    R = win[..., 0].astype(np.int16); G = win[..., 1].astype(np.int16)
-    B = win[..., 2].astype(np.int16)
-    vivid = (G > R + 30) & (G > B + 50) & (G > 150)
+    vivid = _grass_mask(win)
     if arrow is not None:
         vivid = vivid | arrow[y0:y1, x0:x1]
     min_a = max(60, int(0.00012 * rgb.shape[0] * rgb.shape[1]))
@@ -481,7 +493,15 @@ def _fit_disc_local(rgb: np.ndarray, cx: float, cy: float, half: int,
 
 
 def _disc_has_arrow(arrow: np.ndarray, fit: dict, min_px: int = 120) -> bool:
-    """圆盘内是否含足够多的箭头像素（arrow 为已算好的三色掩膜，避免整帧重算）。"""
+    """
+    圆盘内是否含足够多的箭头像素（arrow 为已算好的三色掩膜，避免整帧重算）。
+
+    注意这和另外两处是"同一个问题的三种问法"，阈值各不同，改一处要连着看：
+      · detect_arrow_band —— 三色各数像素，定风速档位（读数用）
+      · measure_arrow     —— 单色窄带取最大团块、≥60px 才算有箭头（测方向用）
+      · 这里              —— 拟合椭圆内宽带箭头 ≥120px 才算这块草地是风盘（定位用）
+    这里故意不复用 measure_arrow：那条路要 LANCZOS 放大 + PCA，丢在定位兜底里太贵。
+    """
     a, b = fit["a"] * 1.35, fit["b"] * 1.45
     cx, cy = fit["cx"], fit["cy"]
     H_, W_ = arrow.shape
@@ -501,9 +521,7 @@ def _find_dial_by_arrow_color(rgb: np.ndarray, hsv: np.ndarray, arrow: np.ndarra
     img_h, img_w = rgb.shape[:2]
     am = arrow.copy()                    # 复用已算好的三色掩膜，避免整帧重算
     am[: int(0.03 * img_h), :] = False
-    R = rgb[..., 0].astype(np.int16); G = rgb[..., 1].astype(np.int16)
-    B = rgb[..., 2].astype(np.int16)
-    vivid = (G > R + 30) & (G > B + 50) & (G > 150)
+    vivid = _grass_mask(rgb)
     min_a = max(40, int(0.00015 * img_w * img_h))
     comps = label_components(am, keep_pixels=True, min_area=min_a)
     cands = []
@@ -544,10 +562,7 @@ def _find_dial_by_disc(rgb: np.ndarray, arrow: np.ndarray,
                        verbose: bool = False,
                        side: str | None = None) -> Dial | None:
     """草地圆盘锚点：找鲜绿圆盘 -> 上沿 RANSAC 椭圆 -> 半径/中心/k。"""
-    R = rgb[..., 0].astype(np.int16); G = rgb[..., 1].astype(np.int16)
-    B = rgb[..., 2].astype(np.int16)
-    grass = (G > R + 30) & (G > B + 50) & (G > 150)
-    grass = grass | arrow
+    grass = _grass_mask(rgb) | arrow
     img_h, img_w = rgb.shape[:2]
     comps = label_components(grass, keep_pixels=True, min_area=300)
     best = None
@@ -654,9 +669,7 @@ def _find_dial_by_prior(rgb: np.ndarray, verbose: bool = False,
         if x1 - x0 < 20 or y1 - y0 < 20:
             continue
         win = rgb[y0:y1, x0:x1]
-        R = win[..., 0].astype(np.int16); G = win[..., 1].astype(np.int16)
-        B = win[..., 2].astype(np.int16)
-        green = (G > R + 25) & (G > B + 45) & (G > 140)
+        green = _grass_mask(win, 25, 45, 140)     # 先验这条窗小、更干净，阈值略松
         comps = label_components(green, min_area=int(0.02 * r * r))
         if not comps:
             continue
@@ -734,9 +747,8 @@ def find_dials(rgb: np.ndarray, hsv: np.ndarray | None = None,
         if cov < 0.78:
             continue
         if grass is None:
-            G = rgb[..., 1].astype(np.int16); R = rgb[..., 0].astype(np.int16)
-            B = rgb[..., 2].astype(np.int16)
-            grass = (G > R + GRASS_GMARGIN) & (G > B + GRASS_GMARGIN) & (G > GRASS_GMIN)
+            # 整帧的绿更杂（远景草地、树），所以这条路的阈值单独放得松
+            grass = _grass_mask(rgb, GRASS_GMARGIN, GRASS_GMARGIN, GRASS_GMIN)
         rr = max(r - 2.0, r * 0.88)                     # 只在候选外接框里算"盘内"
         x0c, x1c = int(max(cx - rr, 0)), int(min(cx + rr, img_w))
         y0c, y1c = int(max(cy - rr, 0)), int(min(cy + rr, img_h))
@@ -944,10 +956,7 @@ def measure_arrow(rgb: np.ndarray, hsv: np.ndarray, dial: Dial,
     band 给定时用单色窄带掩膜取最大团块；band=None 时用多色宽带 + 形状打分（定位兜底）。
     """
     img = Image.fromarray(rgb)
-    pad = dial.r * 0.35
-    box = (int(max(dial.cx - dial.r - pad, 0)), int(max(dial.cy - dial.r - pad, 0)),
-           int(min(dial.cx + dial.r + pad, rgb.shape[1])),
-           int(min(dial.cy + dial.r + pad, rgb.shape[0])))
+    box = _dial_box(dial, rgb.shape)          # 和 detect_arrow_band 用同一个裁剪框
     if box[2] - box[0] < 10 or box[3] - box[1] < 10:
         return None
     crop = img.crop(box)
@@ -1046,34 +1055,6 @@ def _column_runs(mask: np.ndarray) -> list[tuple[int, int]]:
     return runs
 
 
-def _digit_runs(crop: Image.Image, height_ratio: float,
-                max_digits: int) -> list[tuple[int, int, int]]:
-    """
-    切出"数字字形"的列区间，返回 [(x0, x1, 行跨度), ...]。
-    太矮的块（分隔线/噪点）跳过；遇到又宽又矮的块（多半是 "m"）就停 —— 数字在 m/s 之前。
-    """
-    m = _bin_white(crop)
-    if m.sum() < 20:
-        return []
-    runs = _column_runs(m)
-    if not runs:
-        return []
-    heights = [int(m[:, a:b].any(axis=1).sum()) for a, b in runs]
-    hmax = max(heights)
-    if hmax == 0:
-        return []
-    out: list[tuple[int, int, int]] = []
-    for (a, b), h in zip(runs, heights):
-        if h < height_ratio * hmax:
-            continue
-        if (b - a) > 1.15 * h:
-            break
-        out.append((a, b, h))
-        if len(out) >= max_digits:
-            break
-    return out
-
-
 def _find_text_lines(rgb: np.ndarray, dial: Dial,
                      max_lines: int = 3) -> list[tuple[int, int, int, int]]:
     """
@@ -1136,7 +1117,8 @@ def _find_text_lines(rgb: np.ndarray, dial: Dial,
 
 
 def ocr_speed(rgb: np.ndarray, dial: Dial, state: OcrState | None = None,
-              allow=None, best_effort: bool = False) -> dict:
+              allow=None, best_effort: bool = False,
+              boxes: list | None = None) -> dict:
     """识别风盘附近的 "Nm/s" 数字：切出文字行，用字形模板库匹配。
 
     返回 dict(value, raw, conf, box, ok)；模板库为空、不够有把握、或读出的数值
@@ -1147,12 +1129,15 @@ def ocr_speed(rgb: np.ndarray, dial: Dial, state: OcrState | None = None,
 
     allow 给定时只用它筛数值 —— 调用方已经知道箭头颜色时，可以把风速框死在那条
     颜色对应的区间里（箭头是大块纯色，比细笔画数字可靠得多）。
+
+    boxes 给定时直接用这批文字行候选（一场帧里候选框跟风速无关，算一次就够；
+    read_wind 一帧可能读好几轮，传进来能省掉重复的整块搜索）。
     """
     state = state or _DEFAULT_OCR
     ok_val = allow or (lambda v: 0 <= v <= MAX_WIND)
     res = dict(value=None, raw="", conf=0.0, box=None, ok=False, reject=None)
     # 候选文字行按面积从大到小依次试，第一个匹配上的就是风速
-    for roi in _find_text_lines(rgb, dial):
+    for roi in (boxes if boxes is not None else _find_text_lines(rgb, dial)):
         x0, y0, x1, y1 = roi
         res["box"] = [x0, y0, x1, y1]
         crop = Image.fromarray(rgb[y0:y1, x0:x1])
@@ -1202,6 +1187,8 @@ def _glyph_norm(crop: Image.Image,
     给了 band 就按它定高度；水平方向仍按本字形自己的墨迹取满 —— 宽度正是区分数字的
     依据，不能掐（"1" 顶上那个小撇子墨很少，一掐就只剩一根竖杠了）。
     """
+    # 二值化必须用"本字形这块"自己的阈值（_bin_white 是按裁块中位亮度定阈的），
+    # 拿整行算好的掩膜切下来会换一套口径，和模板库的建库口径对不上 —— 别省这一步。
     m = _bin_white(crop)
     h = m.shape[0]
     y0, y1 = band if band else (0, h)
@@ -1294,7 +1281,8 @@ def _run_variants(mask: np.ndarray, runs: list[tuple[int, int]],
 
 
 def _glyph_windows(crop: Image.Image, max_digits: int = 2,
-                   two_start: int = 3, one_start: int = 2
+                   two_start: int = 3, one_start: int = 2,
+                   mask: np.ndarray | None = None
                    ) -> list[list[tuple[int, int]]]:
     """
     列出"可能是数字"的列区间组合，供上层逐个试。
@@ -1305,8 +1293,9 @@ def _glyph_windows(crop: Image.Image, max_digits: int = 2,
     （1 位数只在前 one_start 个块里找：粘连时 "s" 会顶到前面来，得卡死。）
 
     另外再补一份"把过宽粘连块拆开"的列块（见 _split_wide_runs）作为第二组候选。
+    mask 给定时直接拿来用（省一次二值化）。
     """
-    m = _bin_white(crop)
+    m = mask if mask is not None else _bin_white(crop)
     if m.sum() < 20:
         return []
     runs = _column_runs(m)
@@ -1341,16 +1330,22 @@ def match_glyphs(crop: Image.Image,
     的时候 —— 例如黄色箭头 ⇒ 只能是 6~10，那么 5 就被排除在外，剩下的候选里 6 通常
     就是最高分，能把"6 读成 5"救回来。
     """
-    bank = (state or _DEFAULT_OCR).bank
+    # state 是空的（或压根没加载过库）时回落到默认库 —— 否则整条链会静默地"永远读不出风速"
+    bank = ((state or _DEFAULT_OCR).bank) or _DEFAULT_OCR.bank
     if not bank:
         return None
-    band = _line_band(_bin_white(crop))      # 行基准：所有字形共用同一套上下沿
+    m = _bin_white(crop)                     # 整个裁块只二值化这一次（往下传，不再逐层重算）
+    band = _line_band(m)                     # 行基准：所有字形共用同一套上下沿
     fallback: tuple[float, str] | None = None
-    for win in _glyph_windows(crop):
+    normed: dict[tuple[int, int], np.ndarray | None] = {}   # 同一个列块只归一化一次
+    for win in _glyph_windows(crop, mask=m):
         out, worst = "", 1.0
         alt_out, alt_worst = "", 1.0
         for a, b in win:
-            g = _glyph_norm(crop.crop((a, 0, b, crop.height)), band)
+            key = (int(a), int(b))
+            if key not in normed:            # 各候选窗口大量重叠，同一块别算两遍
+                normed[key] = _glyph_norm(crop.crop((a, 0, b, crop.height)), band)
+            g = normed[key]
             if g is None:
                 break
             best, second, digit = 0.0, 0.0, ""
@@ -1493,6 +1488,7 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
     fr = FrameReading(dial=dial)
     ss = max(1, int(supersample or SUPERSAMPLE))
     if speed is None and do_ocr:
+        boxes = _find_text_lines(rgb, dial)          # 一帧只搜一次文字行候选，下面几轮复用
         # ① 先看箭头颜色 ⇒ 风速在哪一档，再让数字在这个窄范围里认。
         #    箭头是盘里最大的一块纯色，比细笔画数字可靠；这样"6 读成 5"这种
         #    跨档误读从源头上就不会发生（5 直接不在候选里）。
@@ -1503,14 +1499,15 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
             def in_band(v, lo=lo, hi=hi):
                 return lo <= v <= hi
 
-            ocr = ocr_speed(rgb, dial, state=ocr_state, allow=in_band)
+            ocr = ocr_speed(rgb, dial, state=ocr_state, allow=in_band, boxes=boxes)
             if ocr.get("value") is None:            # 严格判据没过 → 在该档里挑最像的
-                ocr = ocr_speed(rgb, dial, state=ocr_state, allow=in_band, best_effort=True)
+                ocr = ocr_speed(rgb, dial, state=ocr_state, allow=in_band,
+                                best_effort=True, boxes=boxes)
             fr.ocr = ocr
             if ocr.get("value") is not None:
                 speed = float(ocr["value"])
         if speed is None:                           # 没看出颜色 / 这一档读不出 → 老的全区间读法
-            ocr = ocr_speed(rgb, dial, state=ocr_state)
+            ocr = ocr_speed(rgb, dial, state=ocr_state, boxes=boxes)
             fr.ocr = ocr
             if ocr.get("value") is not None:
                 speed = float(ocr["value"])
@@ -1539,7 +1536,7 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
             if alt is None:
                 continue
             mismatch = True
-            ocr2 = ocr_speed(rgb, dial, state=ocr_state,
+            ocr2 = ocr_speed(rgb, dial, state=ocr_state, boxes=boxes,
                              allow=lambda v, lo=lo, hi=hi: lo <= v <= hi,
                              best_effort=True)
             if ocr2.get("value") is not None:

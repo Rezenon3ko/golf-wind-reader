@@ -406,9 +406,12 @@ class Recognizer:
         self.last_dir: dict[str, str] = {}   # 横向/纵向上一次的方向（做迟滞用）
         self.ocr = W.OcrState()          # 字形模板库状态独立
         n = W.load_glyph_bank(GLYPH_BANK, state=self.ocr)
-        if n:
-            print(f"[字形] 已载入模板库 {GLYPH_BANK}（{n} 个模板，数字 "
-                  f"{W.glyph_bank_digits(state=self.ocr)}）")
+        if not n:
+            # 没库就一定读不出风速 —— 直接报出来（窗口会显示"初始化失败：…"），
+            # 别让它静默地一直显示"风速未识别"，那种没人查得出来。
+            raise RuntimeError(f"字形模板库没载入（文件缺失或损坏）：{GLYPH_BANK}")
+        print(f"[字形] 已载入模板库 {GLYPH_BANK}（{n} 个模板，数字 "
+              f"{W.glyph_bank_digits(state=self.ocr)}）")
 
     # ---- 定位 ----
     def locate(self, rgb) -> bool:
