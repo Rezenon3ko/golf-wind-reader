@@ -44,7 +44,7 @@ class Config:
     """风盘几何的可调参数（集中原先散落在各定位函数里的魔法数字）。"""
     panel_r_frac: float = 0.0600      # 风盘半径 / 画面宽
     disc_panel_ratio: float = 0.522   # 草地圆盘半轴 / 风盘半径
-    k_default: float = 0.83           # 俯视压缩系数兜底
+    k_default: float = 0.82           # 俯视压缩系数兜底
 
 
 CONFIG = Config()
