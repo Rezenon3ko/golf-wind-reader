@@ -17,3 +17,5 @@ nssr-overlay.log*
 nssr-fail-*
 # 字形库总览图（排查用，随手生成）
 glyph_bank_preview.png
+# 字形库素材帧（0-9.png 等真机截图，只在本地留着重造字形库用，不进仓库）
+字形素材/

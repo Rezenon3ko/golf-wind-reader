@@ -44,7 +44,7 @@ class Config:
     """风盘几何的可调参数（集中原先散落在各定位函数里的魔法数字）。"""
     panel_r_frac: float = 0.0600      # 风盘半径 / 画面宽
     disc_panel_ratio: float = 0.522   # 草地圆盘半轴 / 风盘半径
-    k_default: float = 0.82           # 俯视压缩系数兜底
+    k_default: float = 0.82           # 俯视压缩系数兜底（= 草地圆盘自身的压缩比，实测见下）
 
 
 CONFIG = Config()
@@ -67,11 +67,20 @@ MAX_WIND = 15
 # 其余阈值
 # --------------------------------------------------------------------------
 KIND_GAUGE = "gauge3d"       # 3D 风盘（右手右上 / 左手左上）
+# 俯视压缩系数：盘面那个草地圆是真正的地面圆，直接量它的椭圆就是 k。**只用边界点**拟合
+# （用整块内部点做代数拟合会明显偏小：同一帧上内部点给 0.79、边界点给 0.820）。实测 9 m/s
+# 那张：边界点 a=58.4 b=47.9 → k=0.820（rms 0.006）；上下沿都取 → 0.829。所以取 0.82。
+# 注意箭头"顶面"比盘面高一点，理论上压缩略重一点点（<1%），小到看不出，不改。
 DEFAULT_K = CONFIG.k_default
 CYAN_H = (158.0, 218.0)      # 兼容旧判据
 CYAN_S = 0.15
 CYAN_V = 0.42
-TOPFACE_V = 0.80             # 箭头"顶面"（明亮面）的亮度下限
+TOPFACE_V = 0.80             # 箭头"顶面"（明亮面）的亮度下限（只在没有颜色线索的兜底路上用）
+TOPFACE_MIN_FRAC = 0.25      # 窄带测角：切出的顶面至少占整块剪影这么多，才够 PCA 定方向
+TOPFACE_MAX_DEV = 35.0       # 顶面与整块剪影的轴(mod 180)差超过它 → 顶面碎了/取错了，退回剪影
+GLYPH_MIN_AREA_FRAC = 0.15   # 文字行里小于最大团块这个比例的碎墨直接丢（背景斜刺、面板网点、毛边）
+DISC_MASK_PAD = 1.10         # 箭头只在草地圆盘上；按固定版式圈盘面时外扩这么多（箭头尖只探出几像素）
+DISC_COVER_FRAC = 0.50       # 预期圆盘椭圆里的草地覆盖率下限（定位兜底判据，见 _find_dial_by_prior）
 GRASS_GMARGIN = 15           # 草地判据
 GRASS_GMIN = 95
 WHITE_V = 0.68               # 白色 UI（圆环/文字）
@@ -264,6 +273,137 @@ def _bin_white(crop: Image.Image) -> np.ndarray:
     return (mx > thr) & (sat < 0.40)
 
 
+def _morph_shift(mask: np.ndarray, dy: int, dx: int) -> np.ndarray:
+    """按 (dy,dx) 平移掩膜，空出来的地方补 False（不环绕 —— 环绕会把左边的墨搬到右边）。"""
+    h, w = mask.shape
+    out = np.zeros_like(mask)
+    sy, dy_ = (slice(dy, h), slice(0, h - dy)) if dy >= 0 else (slice(0, h + dy), slice(-dy, h))
+    sx, dx_ = (slice(dx, w), slice(0, w - dx)) if dx >= 0 else (slice(0, w + dx), slice(-dx, w))
+    if sy.stop > sy.start and sx.stop > sx.start:
+        out[dy_, dx_] = mask[sy, sx]
+    return out
+
+
+def _morph(mask: np.ndarray, r: int, grow: bool) -> np.ndarray:
+    """方形结构元的膨胀（grow=True）/腐蚀（grow=False），半径 r。"""
+    out = np.zeros_like(mask) if grow else mask.copy()
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            sh = _morph_shift(mask, dy, dx)
+            if grow:
+                out |= sh
+            else:
+                out &= sh
+    return out
+
+
+def _open_mask(mask: np.ndarray, r: int = 1) -> np.ndarray:
+    """
+    开运算（先腐蚀后膨胀）：去掉 ≤2r px 宽的细线、毛刺、抗锯齿桥，粗笔画基本不动。
+
+    风盘那圈面板是半透明的 —— 背景亮（草地/树/面板分隔线）会漏进"白字掩膜"，把数字
+    咬出一根斜刺，还会把粘连的两个字形连在一起。实测一张真帧：'9' 被斜刺污染后字形
+    相似度从 0.91 掉到 0.43（直接读不出风速）；开运算后回到 0.91，还顺手把粘连切开。
+    """
+    if r <= 0:
+        return mask
+    er = _morph(mask, r, grow=False)
+    return _morph(er, r, grow=True)
+
+
+def _drop_small_blobs(mask: np.ndarray, frac: float = GLYPH_MIN_AREA_FRAC) -> np.ndarray:
+    """丢掉比最大团块小太多的碎墨（背景漏进来的斜刺/网点/毛边碎片）。"""
+    comps = label_components(mask, keep_pixels=False, min_area=2)
+    if len(comps) < 2:
+        return mask
+    biggest = max(c.area for c in comps)
+    keep = np.zeros_like(mask)
+    for c in comps:
+        if c.area >= frac * biggest:
+            keep[c.y0:c.y1 + 1, c.x0:c.x1 + 1] |= mask[c.y0:c.y1 + 1, c.x0:c.x1 + 1]
+    return keep
+
+
+def _clean_white_mask(mask: np.ndarray) -> np.ndarray:
+    """白掩膜去噪：开运算 + 丢碎墨。切字块、定行基准、认字形都用这一份，口径保持一致。"""
+    return _drop_small_blobs(_open_mask(mask))
+
+
+def _hole_count(mask: np.ndarray) -> int:
+    """
+    数字的"洞"数：8→2，0/6/9→1，1/2/3/4/5/7→0。
+
+    拓扑是认数字最稳的一条线索 —— 8 和 6 的像素相似度高达 0.79（10 个模板里最像的一对），
+    光靠 IoU 分不开；但"两个洞"和"一个洞"永远不会错。
+    """
+    comps = label_components(~mask, keep_pixels=False, min_area=3)
+    h, w = mask.shape
+    return sum(1 for c in comps
+               if c.x0 > 0 and c.y0 > 0 and c.x1 < w - 1 and c.y1 < h - 1)
+
+
+_HOLES_CACHE: dict[int, int] = {}
+
+
+def _template_holes(t: np.ndarray) -> int:
+    """
+    模板的洞数，按**内容**缓存（一帧里要被问几百次，重算太亏）。
+
+    别按 id() 缓存：模板数组被回收后地址会被别的数组复用，缓存就串味了 —— 实测换一套
+    模板库（等价于换 OcrState）时，8 的洞数会被套到 6 的模板上，数字直接读不出来。
+    """
+    key = t.tobytes()
+    n = _HOLES_CACHE.get(key)
+    if n is None:
+        n = _hole_count(t > 0.5)
+        _HOLES_CACHE[key] = n
+    return n
+
+
+def _disc_ellipse(dial: Dial, shape: tuple[int, int], ss: float = 1.0,
+                  box: tuple[int, int, int, int] = (0, 0, 0, 0),
+                  pad: float = DISC_MASK_PAD) -> np.ndarray:
+    """
+    预期草地圆盘的椭圆掩膜（固定 UI 版式）：盘心在风盘中心上方 0.30·r·(半轴/r)，
+    半轴 = 0.522·r / 0.522·r·k，再外扩 pad 倍。
+
+    箭头永远躺在这个圆盘上 —— 用它把掩膜圈在盘面里，背景（树/草地从半透明面板里
+    透出来的黄绿像素）就进不来了。这是"背景有树时读不出风向"的主因。
+    """
+    a = CONFIG.disc_panel_ratio * dial.r * pad * ss
+    b = a * dial.k
+    cx = (dial.cx - box[0]) * ss
+    cy = (dial.cy - 0.30 * dial.r * CONFIG.disc_panel_ratio - box[1]) * ss
+    out = np.zeros(shape, dtype=bool)
+    x0, x1 = int(max(cx - a, 0)), int(min(cx + a + 1, shape[1]))
+    y0, y1 = int(max(cy - b, 0)), int(min(cy + b + 1, shape[0]))
+    if x1 <= x0 or y1 <= y0:
+        return out
+    # 只在外接框里算椭圆（整幅 mgrid 一帧要 20ms+，这里只要 ~1ms）
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    out[y0:y1, x0:x1] = (((xx - cx) / max(a, 1e-6)) ** 2
+                         + ((yy - cy) / max(b, 1e-6)) ** 2) <= 1.0
+    return out
+
+
+def _disc_turf_coverage(rgb: np.ndarray, cx: float, cy: float, r: float, k: float) -> float:
+    """预期圆盘椭圆里"草地"占的比例：定位兜底用（背景有树时，最大绿团块的几何检查会失手）。"""
+    a = CONFIG.disc_panel_ratio * r
+    b = a * k
+    cy_d = cy - 0.30 * r * CONFIG.disc_panel_ratio
+    h, w = rgb.shape[:2]
+    half_w, half_h = int(a * 1.1), int(b * 1.1)
+    x0, x1 = int(max(cx - half_w, 0)), int(min(cx + half_w + 1, w))
+    y0, y1 = int(max(cy_d - half_h, 0)), int(min(cy_d + half_h + 1, h))
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return 0.0
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    inside = ((xx - cx) / a) ** 2 + ((yy - cy_d) / b) ** 2 <= 1.0
+    grass = _grass_mask(rgb[y0:y1, x0:x1], 25, 45, 140)
+    n = int(inside.sum())
+    return float((grass & inside).sum()) / n if n else 0.0
+
+
 def arrow_mask(hsv: np.ndarray) -> np.ndarray:
     """
     三色宽带箭头掩膜（青/黄/品红）。色相带已排除草地(H≈104°)、天空(H≈206°)；
@@ -340,8 +480,7 @@ def detect_arrow_band(rgb: np.ndarray, dial: Dial,
     if x1 - x0 < 10 or y1 - y0 < 10:
         return None
     hsv = rgb_to_hsv(rgb[y0:y1, x0:x1])
-    yy, xx = np.mgrid[0:hsv.shape[0], 0:hsv.shape[1]]
-    inside = ((xx - (dial.cx - x0)) ** 2 + (yy - (dial.cy - y0)) ** 2) <= (0.97 * dial.r) ** 2
+    inside = _disc_ellipse(dial, hsv.shape[:2], box=(x0, y0, x1, y1))
     best_n, best_band = 0, None
     for _lo, _hi, _name, (h0, h1), smin, vmin in WIND_COLORS:
         n = int(((hsv[..., 0] >= h0) & (hsv[..., 0] <= h1)
@@ -678,6 +817,11 @@ def _find_dial_by_prior(rgb: np.ndarray, verbose: bool = False,
     圆盘在（含 0 m/s），且左右手可由此区分；找到就直接用先验的中心/半径。
     先验只用来"开窗"，找不到就返回 None，交给后面的完整搜索。
     side 给定时只试那一侧（玩家锁定左右手后就不再换）。
+
+    两条判据：① 上面这套"最大绿团块"的几何检查（快）；② ①不成立时退回看**版式** ——
+    预期圆盘椭圆里的草地覆盖率 + 盘里能不能看到风箭头。背景有树/草地时，树也算"绿"，
+    ①的团块几何会被搅黄（表现：一直"没定位到风盘"），②的位置/形状都来自固定 UI 版式，
+    更抗背景；而且要求真的看到风箭头，不会把别的界面误判成瞄准界面。
     """
     img_h, img_w = rgb.shape[:2]
     for name, (fx, fy, fr) in GAUGE_PRIORS:
@@ -718,6 +862,23 @@ def _find_dial_by_prior(rgb: np.ndarray, verbose: bool = False,
                  k=DEFAULT_K, anchored_by=f"prior-{name}")
         if verbose:
             print(f"[定位] 先验({name})：草地 {bw}×{bh}（{len(near)} 块）"
+                  f" -> 中心=({cx:.0f},{cy:.0f}) r={r:.0f}")
+        return d
+    # ② 退路：绿块几何被背景（树/草地）搅黄时，按**固定 UI 版式**判 —— 预期圆盘椭圆
+    # 里的草地覆盖率够高，且盘里确实能看到风箭头，才认。
+    for name, (fx, fy, fr) in GAUGE_PRIORS:
+        if side is not None and name != side:
+            continue
+        cx, cy, r = fx * img_w, fy * img_h, fr * img_w
+        cov = _disc_turf_coverage(rgb, cx, cy, r, DEFAULT_K)
+        if cov < DISC_COVER_FRAC:
+            continue
+        d = Dial(kind=KIND_GAUGE, cx=float(cx), cy=float(cy), r=float(r),
+                 k=DEFAULT_K, anchored_by=f"layout-{name}")
+        if detect_arrow_band(rgb, d, min_px=60, relax=0.30) is None:
+            continue
+        if verbose:
+            print(f"[定位] 版式({name})：圆盘草地覆盖 {cov:.2f} + 盘内有箭头"
                   f" -> 中心=({cx:.0f},{cy:.0f}) r={r:.0f}")
         return d
     return None
@@ -834,10 +995,6 @@ class ArrowReading:
     tail: tuple = (0.0, 0.0)
 
 
-def _angle_mod180(v: np.ndarray) -> float:
-    return math.degrees(math.atan2(v[1], v[0])) % 180.0
-
-
 def _bbox_gap(a: "Component", b: "Component") -> float:
     """两个外接框之间的间距（相邻为 0，重叠为 0）。"""
     dx = max(a.x0 - b.x1, b.x0 - a.x1, 0)
@@ -949,9 +1106,37 @@ def estimate_direction(P: np.ndarray):
     """估计箭头在画面上的指向 φ（0=正上，顺时针）：PCA 定轴 + 宽度剖面定尖端。"""
     if len(P) < 40:
         return 0.0, {}
-    c = P.mean(axis=0)
-    _, _, vt = np.linalg.svd(P - c, full_matrices=False)
-    d = _tip_tail_direction(P, _angle_mod180(vt[0]))
+    d = _tip_tail_direction(P, _principal_axis(P))
+    if d is None:
+        return 0.0, {}
+    return d[0], {"pca": round(d[0], 2), "conf": round(float(d[1]), 3)}
+
+
+def _principal_axis(P: np.ndarray) -> float:
+    """
+    点集主轴（mod 180，角度制）。2×2 协方差闭式解，和 SVD 首奇异向量等价但快一个量级 ——
+    箭头有几千到几万点，原来每帧要跑两次 SVD，是 measure_arrow 的主要开销。
+    """
+    X = P - P.mean(axis=0)
+    xx = float((X[:, 0] * X[:, 0]).sum())
+    yy = float((X[:, 1] * X[:, 1]).sum())
+    xy = float((X[:, 0] * X[:, 1]).sum())
+    return math.degrees(0.5 * math.atan2(2.0 * xy, xx - yy)) % 180.0
+
+
+def estimate_direction_ground(P: np.ndarray, k: float):
+    """
+    在"去压缩"后的盘面平面上估方向：先把屏幕纵坐标除以 k（undo 俯视压缩），再走同一套
+    PCA + 宽度剖面定尖端。返回的角直接是**盘面角 θ**（0=正前，顺时针），不是画面角 φ。
+
+    为什么尖端投票必须换到去压缩平面：屏幕空间里"垂直于轴的宽度"混进了长度方向 —— 箭头
+    斜置时头部的宽度会被压扁，合成箭头实测 30°/150°/210°/330° 会把尖端判反（差 168°）。
+    同一批样本换到去压缩平面后 12/12 正确，且宽度剖面就是箭头真实的头/杆宽度比。
+    """
+    if len(P) < 40:
+        return 0.0, {}
+    Q = np.stack([P[:, 0], P[:, 1] / max(k, 1e-6)], axis=1)
+    d = _tip_tail_direction(Q, _principal_axis(Q))
     if d is None:
         return 0.0, {}
     return d[0], {"pca": round(d[0], 2), "conf": round(float(d[1]), 3)}
@@ -969,12 +1154,50 @@ def _tip_tail_points(P: np.ndarray, phi: float):
     return tuple(float(v) for v in tip), tuple(float(v) for v in tail)
 
 
+def _ang_gap(a: float, b: float) -> float:
+    """两个方向之间的最小夹角（度，0~180）。"""
+    return abs(((a - b + 180.0) % 360.0) - 180.0)
+
+
+def _otsu_threshold(values: np.ndarray, nbins: int = 64) -> float:
+    """
+    一维 Otsu：把这组亮度切成"亮/暗"两类，返回分界亮度。
+
+    用来自适应地切出箭头顶面 —— 顶上"亮面 vs 侧壁"的**相对**亮度差在采集卡洗淡画面后
+    基本不变，而写死的绝对亮度门槛（TOPFACE_V=0.80）会被洗淡一路带崩。
+    """
+    vals = np.asarray(values, dtype=np.float64)
+    if vals.size < 32:
+        return float(np.median(vals)) if vals.size else 0.0
+    hist, edges = np.histogram(vals, bins=nbins, range=(0.0, 1.0))
+    hist = hist.astype(np.float64)
+    total = float(hist.sum())
+    if total <= 0:
+        return 0.0
+    centre = np.arange(nbins) + 0.5
+    omega = np.cumsum(hist)                       # 前 k 档像素数
+    mu = np.cumsum(hist * centre)                 # 前 k 档亮度和
+    mu_t = mu[-1]
+    denom = omega * (total - omega)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        between = np.where(denom > 0, (mu_t * omega - mu * total) ** 2 / denom, 0.0)
+    k = int(np.argmax(between)) if between.size else 0
+    k = max(0, min(k, nbins - 2))
+    return float((edges[k] + edges[k + 1]) / 2.0)
+
+
 def measure_arrow(rgb: np.ndarray, hsv: np.ndarray, dial: Dial,
                   supersample: int = 6,
                   band: tuple[float, float, float, float] | None = None) -> ArrowReading | None:
     """
     测量箭头在画面上的指向 φ（0=正上，顺时针）。
     band 给定时用单色窄带掩膜取最大团块；band=None 时用多色宽带 + 形状打分（定位兜底）。
+
+    band 给定（正常路：风速已读出 ⇒ 箭头颜色已知）时，窄带剪影里通常**同时**含"亮顶面 +
+    暗侧壁"两层：侧壁沿着形状下缘铺一条，会把 PCA 往画面下方拽 —— 合成 3D 箭头实测侧壁
+    14px（箭头长 110px）时测角偏 2~5°、22px 时偏到 8°，且偏向随箭头朝向变化。顶面才是
+    平行于盘面、和 k 模型前提一致的那张面，所以能切出顶面就用顶面，切不出（顶面太碎/太暗）
+    才退回整块剪影。
     """
     img = Image.fromarray(rgb)
     box = _dial_box(dial, rgb.shape)          # 和 detect_arrow_band 用同一个裁剪框
@@ -997,8 +1220,11 @@ def measure_arrow(rgb: np.ndarray, hsv: np.ndarray, dial: Dial,
     rr = dial.r * ss * 0.97
     yy, xx = np.mgrid[0:arr.shape[0], 0:arr.shape[1]]
     inside = ((xx - cxs) ** 2 + (yy - cys) ** 2) <= rr * rr
-    clip &= inside
-    topf &= inside
+    # 只在草地圆盘上找箭头：半透明面板会把背景（树/草地）的黄绿像素漏进来，不圈住就会
+    # 把背景当箭头（表现就是"背景有树时读不出风向"）。
+    on_disc = _disc_ellipse(dial, arr.shape[:2], ss=ss, box=box)
+    clip &= inside & on_disc
+    topf &= inside & on_disc
 
     def pick(mask):
         comps = label_components(mask, keep_pixels=True, min_area=30)
@@ -1023,16 +1249,35 @@ def measure_arrow(rgb: np.ndarray, hsv: np.ndarray, dial: Dial,
     P_sil = pick(clip)
     if P_sil is None or len(P_sil) < 60:
         return None
+    phi, samples = estimate_direction(P_sil)          # 兜底估计：整块剪影（屏幕空间）
+    P_use = P_sil
     if band is not None:
-        # 窄带的饱和度/亮度门槛已把侧面、背景滤掉，直接用即可
-        P_use = P_sil
+        # 正常路（风速已读出 ⇒ 箭头颜色已知）：用 Otsu 自适应分界把窄带剪影切成"亮顶面 /
+        # 暗侧壁"，能用顶面就用顶面（见函数注释），并且**在去压缩平面上定尖端**。
+        thr = _otsu_threshold(hb[..., 2][clip])
+        bright = clip & (hb[..., 2] >= thr)
+        dark = clip & ~bright
+        ys_b = np.nonzero(bright)[0]
+        ys_d = np.nonzero(dark)[0]
+        # 侧壁永远铺在顶面下缘 ⇒ 亮面质心该在暗面之上；反过来多半是光照/色彩异常，不敢用
+        lit_on_top = (not ys_d.size) or (ys_b.size and ys_b.mean() < ys_d.mean())
+        P_top = pick(bright) if lit_on_top else None
+        if P_top is not None and len(P_top) >= 60 and len(P_top) >= TOPFACE_MIN_FRAC * len(P_sil):
+            theta_top, samples_top = estimate_direction_ground(P_top, dial.k)
+            # 顶面与整块剪影的**轴**（mod 180）差太多 ⇒ 顶面碎了/取错了，不冒险
+            theta_sil = apparent_to_true(phi, dial.k) if samples else None
+            agrees = (theta_sil is None
+                      or _ang_gap(theta_top % 180.0, theta_sil % 180.0) <= TOPFACE_MAX_DEV)
+            if samples_top and agrees:
+                P_use, samples = P_top, samples_top
+                phi = true_to_apparent(theta_top, dial.k)   # 换回画面角，下游照旧走 apparent_to_true
     else:
         P_top = pick(topf)
         use_top = dial.kind == KIND_GAUGE
         if P_top is None or len(P_top) < 60:
             P_top, use_top = P_sil, False
         P_use = P_top if use_top else P_sil
-    phi, samples = estimate_direction(P_use)
+        phi, samples = estimate_direction(P_use)
     if not samples:
         return None
     tip, tail = _tip_tail_points(P_use, phi)
@@ -1092,7 +1337,9 @@ def _find_text_lines(rgb: np.ndarray, dial: Dial,
         return []
     # 只在这条窄带里算 HSV（整帧 HSV 约 70ms）
     hsv = rgb_to_hsv(rgb[y0:y1, x0:x1])
-    m = (hsv[..., 2] > 0.55) & (hsv[..., 1] < 0.45)
+    # 先开运算：面板是半透明的，背景亮（草地/树/面板分隔线）会漏进白掩膜，既会把文字框
+    # 撑高（0.18r~0.50r 的高度检查直接判掉整行），也会把相邻字形连成一块。
+    m = _open_mask((hsv[..., 2] > 0.55) & (hsv[..., 1] < 0.45))
     # 面积下限 0.0035·r²：排掉面板网点小斑点，又不误杀小分辨率下的真文字
     min_area = max(8, int(0.0035 * r * r))
     comps = [c for c in label_components(m, keep_pixels=False, min_area=min_area)
@@ -1285,6 +1532,12 @@ def _split_wide_runs(mask: np.ndarray, runs: list[tuple[int, int]],
             continue
         order = sorted(range(lo, hi), key=lambda i: int(col[i]))
         k = order[min(kth, len(order) - 1)]
+        # 只认"真正的缝"：数字内部的细腰（比如 4 的横杠那一列）也常常是全块最细的列，
+        # 从那儿下刀会把 4 切成"竖杠 + 残块"→ 竖杠被认成 1。缝的墨量要明显低于全块中位数。
+        med = float(np.median(col[lo:hi]))
+        if col[k] > max(2.0, 0.35 * med):
+            out.append((a, b))
+            continue
         out.append((a, a + k))
         out.append((a + k, b))
     return out
@@ -1355,10 +1608,14 @@ def match_glyphs(crop: Image.Image,
     bank = ((state or _DEFAULT_OCR).bank) or _DEFAULT_OCR.bank
     if not bank:
         return None
-    m = _bin_white(crop)                     # 整个裁块只二值化这一次（往下传，不再逐层重算）
+    # 整个裁块只二值化这一次（往下传，不再逐层重算），并先清一遍：开运算去掉背景漏进来的
+    # 细刺/毛边、顺手把粘连的两个字形分开，再丢掉远小于最大团块的碎墨（否则一根斜刺会
+    # 变成一个"列块"，被当成 '1' —— 实测真帧里 '9' 左边就有这么一根）。
+    m = _clean_white_mask(_bin_white(crop))
     band = _line_band(m)                     # 行基准：所有字形共用同一套上下沿
     fallback: tuple[float, str] | None = None
     normed: dict[tuple[int, int], np.ndarray | None] = {}   # 同一个列块只归一化一次
+    holes_of: dict[tuple[int, int], int] = {}               # 洞数同理（label_components 不便宜）
     for win in _glyph_windows(crop, mask=m):
         out, worst = "", 1.0
         alt_out, alt_worst = "", 1.0
@@ -1366,14 +1623,24 @@ def match_glyphs(crop: Image.Image,
             key = (int(a), int(b))
             if key not in normed:            # 各候选窗口大量重叠，同一块别算两遍
                 normed[key] = _glyph_norm(crop.crop((a, 0, b, crop.height)), band)
+                holes_of[key] = -1           # 惰性算：真要用到这一步才数洞
             g = normed[key]
             if g is None:
                 break
+            if holes_of[key] < 0:
+                holes_of[key] = _hole_count(g > 0.5)
             best, second, digit = 0.0, 0.0, ""
             best_ok, digit_ok = 0.0, ""
+            # 拓扑约束：字形**看得出洞**时，洞数必须和模板一致。8 是唯一有两个洞的数字，
+            # 而 8 和 6 的像素相似度高达 0.79（全库最像的一对）—— 只靠 IoU 会互相认错。
+            # 只在输入确实有洞时才卡（洞=0 也可能是圈被抗锯齿/压缩咬断了，不能反过来定死）。
+            # 洞数不符的模板直接不进 best/second，否则 8 的那点差距会被 6 抢走。
+            holes_g = holes_of[key]
             for d, temps in bank.items():
                 allowed = accept is None or accept(int(d))
                 for t in temps:
+                    if holes_g and _template_holes(t) != holes_g:
+                        continue
                     sc = _glyph_sim(g, t)
                     if sc > best:
                         second = max(second, best)
@@ -1437,6 +1704,12 @@ def apparent_to_true(phi: float, k: float) -> float:
     x = math.sin(p) * k          # 反投影后的平面坐标
     y = -math.cos(p)
     return math.degrees(math.atan2(x, -y)) % 360.0
+
+
+def true_to_apparent(theta: float, k: float) -> float:
+    """真实夹角 θ -> 画面夹角 φ（apparent_to_true 的逆）：φ = atan2(sinθ, k·cosθ)。"""
+    t = math.radians(theta % 360.0)
+    return math.degrees(math.atan2(math.sin(t), k * math.cos(t))) % 360.0
 
 
 def wind_metrics(speed: float | None, theta: float) -> dict:
