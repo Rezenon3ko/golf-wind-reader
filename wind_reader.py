@@ -657,20 +657,34 @@ def _find_dial_by_prior(rgb: np.ndarray, verbose: bool = False,
         R = win[..., 0].astype(np.int16); G = win[..., 1].astype(np.int16)
         B = win[..., 2].astype(np.int16)
         green = (G > R + 25) & (G > B + 45) & (G > 140)
-        comps = [c for c in label_components(green, min_area=int(0.02 * r * r))
-                 if 0.5 <= c.w / float(max(c.h, 1)) <= 1.6]      # 圆盘：略宽于高
+        comps = label_components(green, min_area=int(0.02 * r * r))
         if not comps:
             continue
-        c = max(comps, key=lambda z: z.area)
         # 圆盘在盘面中心上方 0.30·disc_a（0 m/s 也是这个布局）；
-        # 质心离得太远说明窗口里是别的绿色物体 —— 不采信，交回完整搜索。
         exp_cy = cy - 0.30 * r * CONFIG.disc_panel_ratio
-        if math.hypot((x0 + c.cx) - cx, (y0 + c.cy) - exp_cy) > 0.5 * r:
+        # 箭头横躺时会盖住圆盘中间，把草地切成好几块 —— 只认"单一团块"会整个漏掉
+        # 这一帧（实测 6m/s 那张就是这么定位失败的）。所以把圆盘附近的绿块合起来看，
+        # 离得远的绿块（背景草地/树）不算。
+        near = [c for c in comps
+                if math.hypot((x0 + c.cx) - cx, (y0 + c.cy) - exp_cy) <= 0.6 * r]
+        if not near:
             continue
+        gx0 = min(c.x0 for c in near); gx1 = max(c.x1 for c in near)
+        gy0 = min(c.y0 for c in near); gy1 = max(c.y1 for c in near)
+        bw, bh = gx1 - gx0, gy1 - gy0
+        if not (0.6 <= bw / float(max(bh, 1)) <= 1.5):           # 圆盘：略宽于高
+            continue
+        if (gx1 - gx0) * (gy1 - gy0) < 0.5 * math.pi * (r * 0.5) ** 2:
+            continue
+        # 合起来的草地至少要有圆盘的 1/4 —— 圆盘被箭头挡掉一部分是正常的
+        if sum(c.area for c in near) < 0.25 * math.pi * (bw / 2.0) * (bh / 2.0):
+            continue
+        c = max(near, key=lambda z: z.area)
         d = Dial(kind=KIND_GAUGE, cx=float(cx), cy=float(cy), r=float(r),
                  k=DEFAULT_K, anchored_by=f"prior-{name}")
         if verbose:
-            print(f"[定位] 先验({name})：圆盘 {c.w}×{c.h} -> 中心=({cx:.0f},{cy:.0f}) r={r:.0f}")
+            print(f"[定位] 先验({name})：草地 {bw}×{bh}（{len(near)} 块）"
+                  f" -> 中心=({cx:.0f},{cy:.0f}) r={r:.0f}")
         return d
     return None
 
@@ -1243,11 +1257,17 @@ def _split_wide_runs(mask: np.ndarray, runs: list[tuple[int, int]],
     粘连处通常只有几个抗锯齿像素，是块内墨迹最少的列，从那儿下刀基本能分开。
     但"最细的列"未必正好是接缝（m 的竖笔之间也可能更细），所以调用方会多切几个位置，
     切错了没关系 —— 切出来的块不像数字，匹配那关自然会被刷掉。
+
+    **只拆最左边那一块，而且只在这块"宽得不像单个字形"时才拆**：
+    数字永远在最左边，粘连（1+m、13 之类）只可能发生在那里。拆别的块纯属惹祸 ——
+    实测把 "6m/s" 的 m 拆开，碎片能凑成 "5"（0.77）而真数字反而被挤掉。
     """
     out: list[tuple[int, int]] = []
-    for a, b in runs:
+    for idx, (a, b) in enumerate(runs):
         w = b - a
-        if w < 12:                                   # 窄块本来就是一个字形，不动
+        h = int(mask[:, a:b].any(axis=1).sum())
+        # 不是最左边那块、或宽度还在"单个字形"范围内 → 原样保留
+        if idx != 0 or w < 12 or w <= 1.15 * max(h, 1):
             out.append((a, b))
             continue
         col = mask[:, a:b].sum(axis=0)
@@ -1354,7 +1374,10 @@ def match_glyphs(crop: Image.Image,
             #   实测干净切出来的 "1" 也只有 0.66），但它跟第二名的差距极大（0.66 vs 0.45）。
             #   反过来 "/"、"s" 这些杂块是"谁都不像"：最高 0.70、第二名 0.69，差距只有 0.01。
             #   所以：绝对分兜个底 + 差距要求大，两个都要满足。
-            if best < 0.60 or (best - second) < 0.10:
+            # 但"绝对分很高"本身就是强证据，这时差距可以放宽：实测真图里的 "6" 是
+            # 0.820 / 次 0.731（差 0.088），和 "8" 差一口气就差 0.01 没够着 0.10，
+            # 结果真数字被判掉、反而让杂块钻空子 —— 所以 0.80 以上放宽到 0.06。
+            if best < 0.60 or (best - second < 0.06 and best < 0.80):
                 break                       # 这个字形不像数字（m / s / 杂块）→ 换下一组
             out += digit
             worst = min(worst, best)
