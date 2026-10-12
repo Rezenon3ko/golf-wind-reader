@@ -91,6 +91,12 @@ RELOCATE_BAD = 6                   # 连续这么多帧读不出来就丢掉缓�
 HYST = 0.05                        # 横向/纵向 |值| 小于它就沿用上一次方向（0 附近不抖）
 FLIP_CONF = 0.6                    # 方向置信度低于此值时才做反 180° 保护
 FLIP_RUN = 3                       # 连续这么多次"反向"才认为真的转向了
+STEADY_DEG = 1.5                   # 最近几拍角度都在这个跨度内 → 判定画面静止
+                                   # （实测静止时抖动 0.6~1.1°，取 1.5° 留余量；转视角每拍动好几度，不受影响）
+STEADY_MIN = 3                     # 至少攒这么多拍才开始取平均
+STEADY_N = 5                       # 参与平均的最近读数个数（2 次/秒 → 约 2.5 秒）
+RELEASE_DEG = 4.0                  # 新读数离平均值超过它 → 认定真转了，立刻放开
+STEADY_STEP = 0.2                  # 静止时输出只在平均值变动超过它才更新（于是显示"定住"）
 
 
 # ==========================================================================
@@ -404,6 +410,8 @@ class Recognizer:
         self.last_theta: float | None = None
         self.flip_run = 0                # 连续"反向"次数
         self.last_dir: dict[str, str] = {}   # 横向/纵向上一次的方向（做迟滞用）
+        self.recent: list[float] = []    # 最近几拍的真实夹角（做"静止取平均"用）
+        self.held: float | None = None   # 静止时"定住"的输出角度
         self.ocr = W.OcrState()          # 字形模板库状态独立
         n = W.load_glyph_bank(GLYPH_BANK, state=self.ocr)
         if not n:
@@ -431,6 +439,7 @@ class Recognizer:
     def reset(self) -> None:
         """丢掉缓存的定位（保留左右手锁定），下帧重新找 —— 识别出错时用。"""
         self.dial, self.shape, self.bad = None, None, 0
+        self.recent.clear()
 
     def recognize(self, rgb) -> dict:
         t0 = time.time()
@@ -455,6 +464,7 @@ class Recognizer:
             self.bad += 1
             if self.bad >= RELOCATE_BAD:      # 一直读不出来：多半是定位错了（或界面切走又切回）
                 self.dial, self.side, self.bad = None, None, 0   # 清缓存，下帧重新定位+重判左右
+                self.recent.clear()
                 if self.args.verbose:
                     print("\n[定位] 连续读不出来 → 丢弃缓存，重新定位")
         if fr.ocr is not None and fr.ocr.get("value") is None and self.args.verbose:
@@ -469,14 +479,59 @@ class Recognizer:
         if not fr.ok:
             return {"ok": False, "message": fr.message, "speed": fr.speed, "dial": d}
 
-        # 只做"反 180° 保护"，不做多拍平滑 —— 平滑会把显示滞后 1~2 秒（快速转视角时很明显）
+        # 反 180° 保护 → 静止取平均（抖动抑制）
         theta = self._flip_guard(fr.theta, fr.arrow.conf if fr.arrow else 1.0)
+        theta = self._steady_theta(theta)
 
         wind = W.wind_metrics(fr.speed, theta)
         self._hold_dir(wind)
         return {"ok": True, "speed": fr.speed, "phi": fr.phi, "k": fr.k, "theta": theta,
                 "wind": wind, "dial": d, "arrow": fr.arrow,
                 "latency_ms": (time.time() - t0) * 1000.0}
+
+    # ---- 抖动抑制：静止时取平均并定住 ----
+    def _steady_theta(self, theta: float) -> float:
+        """
+        画面没动的时候，风向箭头每拍仍有零点几度的测量噪声（实测静止时跨度 ~0.6°、
+        σ≈0.16°），横风经系数放大后就看得出在跳。
+
+        这里做"静止就平均、动起来就立刻放开"：
+          · 最近 STEADY_N 拍的角度跨度 ≤ STEADY_DEG（1°）→ 判为静止，输出它们的圆周平均
+            （平均后噪声只剩 0.07° 量级，显示就定住了）；
+          · 只要新读数离当前平均超过 RELEASE_DEG（4°）→ 判定真的转了，立刻清空重来，
+            所以转视角时不会有任何滞后（不满足静止条件时直接返回原始读数）。
+          · 输出再过一道迟滞（STEADY_STEP）：平均值没挪够 0.2° 就不动显示 —— 否则
+            均值会随窗口滑动一直小幅漂，看起来还是在跳。
+        """
+        if self.recent:
+            dev = abs(((theta - self._circ_mean(self.recent) + 180.0) % 360.0) - 180.0)
+            if dev > RELEASE_DEG:
+                self.recent.clear()          # 真转了 → 旧样本作废
+                self.held = None
+        self.recent.append(theta)
+        if len(self.recent) > STEADY_N:
+            self.recent.pop(0)
+        if len(self.recent) >= STEADY_MIN and self._ang_span(self.recent) <= STEADY_DEG:
+            m = self._circ_mean(self.recent) % 360.0      # 与原始 θ 一样用 0~360 口径
+            if self.held is None or abs(((m - self.held + 180.0) % 360.0) - 180.0) > STEADY_STEP:
+                self.held = m
+            return self.held
+        self.held = None
+        return theta
+
+    @staticmethod
+    def _circ_mean(deg: list[float]) -> float:
+        """角度平均走圆周：179° 和 -179° 的平均是 180°，不是 0°。"""
+        x = sum(math.cos(math.radians(d)) for d in deg)
+        y = sum(math.sin(math.radians(d)) for d in deg)
+        return math.degrees(math.atan2(y, x))
+
+    @staticmethod
+    def _ang_span(deg: list[float]) -> float:
+        """一组角度相对其圆心的最大跨度（度）。"""
+        m = Recognizer._circ_mean(deg)
+        devs = [((d - m + 180.0) % 360.0) - 180.0 for d in deg]
+        return max(devs) - min(devs)
 
     def _hold_dir(self, wind: dict) -> None:
         """
