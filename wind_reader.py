@@ -606,6 +606,10 @@ def _relax_band(band: tuple[float, float, float, float],
 GAUGE_PRIOR = (0.8802, 0.1296, 0.0600)
 GAUGE_PRIOR_LEFT = (1.0 - GAUGE_PRIOR[0], GAUGE_PRIOR[1], GAUGE_PRIOR[2])
 GAUGE_PRIORS = (("右", GAUGE_PRIOR), ("左", GAUGE_PRIOR_LEFT))
+# 风盘中心允许偏离先验多少（画面宽/高的比例）—— 见 _in_gauge_zone 的注释：
+# 真机 11 张实测抖动 ≤0.5%W/1.2%H，这里给 6%/10%，把"小地图那一带的白色 UI"挡在外面。
+GAUGE_ZONE_TOL_X = 0.06
+GAUGE_ZONE_TOL_Y = 0.10
 
 @dataclass
 class Dial:
@@ -627,22 +631,29 @@ def _ring_coverage(pts: np.ndarray, cx: float, cy: float, nbins: int = 72) -> fl
 
 def _in_gauge_zone(cx: float, cy: float, shape, side: str | None = None) -> bool:
     """
-    风盘在画面上方**任一角**：右手在右上，左手（HUD 镜像）在左上。
+    风盘只可能在**两个固定位置**上：右手右上、左手左上（HUD 是镜像的，位置一一对应）。
+
+    这里卡的是"**离先验有多近**"，不是"上方 + 左右 30%"那种大范围。原因：风盘是固定版式
+    的 HUD，实测 11 张真帧的白环拟合中心离先验最多 0.5%W / 1.2%H —— 位置基本是死的；
+    而风盘**下方**固定跟着小地图（左右布局都一样），小地图那些白色 UI（圆角框、风速徽章、
+    缩放手柄）会被白环/圆盘拟合当成风盘：实测就抓到过一个 (1514,163)，离先验 9.2%W，
+    掩膜只有 776px（正常 2200+），读出来的是小地图附近的东西。
+    容忍度给 6%W / 10%H：比真机抖动大一个量级，又能把那种离得远的一律挡掉。
 
     side 给定时只认那一侧 —— 玩家一局之内不会换手，锁定侧别可以彻底避免
     "在对侧误抓一个白色 UI 当风盘"（那种情况下会一直报"风速未识别"）。
 
-    cy 限在 27% 以内：小地图右下角那个"风速徽章"长得跟风盘一模一样（白圈 + 箭头 +
-    Nm/s），位置就在 30% 上下 —— 之前它会被当成风盘，读的是小地图上的数字。
+    注意调用方给的可能是**圆盘中心**（草地圆盘在风盘中心上方约 0.24r）而不是风盘中心，
+    所以纵向容差要留得比横向宽。
     """
     h, w = shape[:2]
-    if cy > 0.27 * h:
-        return False
-    if side == "右":
-        return cx >= 0.70 * w
-    if side == "左":
-        return cx <= 0.30 * w
-    return cx >= 0.70 * w or cx <= 0.30 * w
+    for name, (fx, fy, _fr) in GAUGE_PRIORS:
+        if side is not None and name != side:
+            continue
+        if (abs(cx - fx * w) <= GAUGE_ZONE_TOL_X * w
+                and abs(cy - fy * h) <= GAUGE_ZONE_TOL_Y * h):
+            return True
+    return False
 
 
 def _fit_ellipse_4pt(pts: np.ndarray):
