@@ -182,6 +182,10 @@ HEAD_SIZE = 24                 # 正常显示的字号（两行统一）
 ERROR_SIZE = HEAD_SIZE - 6     # 提示/报错的字号：小一号，Windows 上 24pt 太大、长句会被切
 ERR_MIN_SIZE = 12              # 提示字号的**下限**：放不下就逐级缩小，缩到这么小为止（再小就难认了）
 GAP = 10                       # 同一行里两项之间的间距（两行共用一个值）
+# 整窗缩放（长宽比固定）：字号、间距、输入框宽度一起按同一比例走，所以比例不会变
+MIN_SCALE = 0.5
+MAX_SCALE = 4.0
+SCALE_STEP = 1.1               # 滚轮/菜单每次缩放比例
 # 量窗口尺寸用的"最长一行"样本（定死尺寸，文字变长也不会跑出屏幕）
 SAMPLES = (("↘  15 m/s", "+179.9°", "→ 13.55", "↑ 13.55"),   # 正常结果的最宽一拍
            ("·  0 m/s（无风）", "", "", ""))                   # 无风提示
@@ -330,6 +334,12 @@ class Reader(threading.Thread):
             tq, td = getattr(src, "last_timing", (0.0, 0.0))
             d = st.get("dial")
             where = f"风盘({d.cx:.0f},{d.cy:.0f}) r={d.r:.0f}" if d else "没定位到风盘"
+            if d is not None:
+                # k 是每帧实测的俯视压缩比；掩膜用的是"顶面"还是"剪影"决定读数有没有侧壁偏置
+                arrow = st.get("arrow")
+                where += f" k={d.k:.3f}"
+                if arrow is not None and getattr(arrow, "source", ""):
+                    where += f" 掩膜={arrow.source}({arrow.n_pixels}px)"
             ocr = st.get("ocr") or {}
             if ocr.get("box"):
                 where += f" 数字框{ocr['box']}"
@@ -363,12 +373,15 @@ class Reader(threading.Thread):
     @staticmethod
     def _dump(rgb, st: dict) -> None:
         """
-        把"读不出风速"的那一帧存下来（最多 3 组，循环覆盖），方便离线定位。
+        把"定位到风盘但读不出来"的那一帧存下来（最多 6 组），方便离线定位。
+
+        凡是"风速读不出"（数字没认出来）和"箭头找不到"（θ=None）都会走到这里 ——
+        这两种正是最难离线复现的失败，多存几张才够排查。
 
         整帧缩到 1280 宽存 JPEG（体积小，看上下文够用）；数字框单独放大 4× 存 PNG，
         因为要抠字形的是它，不能有 JPEG 噪点。
         """
-        if Reader._DUMPS >= 3:
+        if Reader._DUMPS >= 6:
             return
         Reader._DUMPS += 1
         try:
@@ -518,6 +531,11 @@ class Overlay:
         self.win_w, self.win_h = max(self.win_w, 200), max(self.win_h, 60)   # 兜底
         self.text_px = max(80, self.win_w - 2 * PAD - 6)   # 第一行提示可用的像素宽
         self.cur_w = self.win_w                          # 当前窗口宽度（提示时会临时加宽）
+        # 缩放基准：窗口/字号/间距都按 base_* × scale 走，长宽比自然不变
+        self.base_w, self.base_h = self.win_w, self.win_h
+        self.scale = 1.0
+        self.pad, self.gap = PAD, GAP
+        self.cur_h = self.win_h
         self.l_wind.config(text="·  --")
         self.l_ang.config(text="")
         self.l_lat.config(text="")
@@ -527,11 +545,16 @@ class Overlay:
                    self.row, self.l_lat, self.l_lon,
                    self.calc, self.l_mul, self.l_eq, self.l_prod)
         self._dx = self._dy = None
+        self._grip_from = None                        # 拖左下角把手时的起始状态（见 _press/_drag）
         for w in widgets:                             # 拖动
             w.bind("<Button-1>", self._press)
             w.bind("<B1-Motion>", self._drag)
         self.menu = tk.Menu(self.root, tearoff=0)
         self.menu.add_command(label=f"NSSR风向识别 v{APP_VERSION}", state="disabled")
+        self.menu.add_separator()
+        self.menu.add_command(label="放大", command=lambda: self._zoom(SCALE_STEP))
+        self.menu.add_command(label="缩小", command=lambda: self._zoom(1.0 / SCALE_STEP))
+        self.menu.add_command(label="恢复默认大小", command=lambda: self._set_scale(1.0))
         self.menu.add_separator()
         self.menu.add_command(label="退出", command=self.quit)
         self._menu_at: tuple[int, int, int, int] | None = None   # 菜单弹出时占的屏幕区域（退出时要擦掉）
@@ -541,6 +564,31 @@ class Overlay:
             w.bind("<Button-2>", self._popup)
         for seq in ("<Button-3>", "<Button-2>"):      # 输入框也给右键菜单，但不参与拖动
             self.ent.bind(seq, self._popup)
+
+        # 左下角缩放把手（无边框窗口没有系统边框，得自己给一个）+ 滚轮缩放。
+        # 放左下角是因为窗口默认贴屏幕右上角：拖这个角时右上角钉住，最符合手感。
+        # 事件不用单独绑：Tk 的 bindtags 会把子控件的事件也送到顶层窗口，统一在
+        # _press/_drag/_release 里按 e.widget 分流（否则"拖窗口"和"缩放"会同时启动，互相打架）。
+        # 图形用 "◣"：直角正好坐在左下角、斜边朝窗口内 —— 角落把手就该这么画（别改成 ◢）。
+        # 要调的是**光标**方向：
+        # 光标按平台挑：Windows 认 size_ne_sw（↙↗ 双向缩放，最贴切）；macOS 不认这个名字，
+        # 退到 X11 名的 bottom_left_corner（↙ 单箭头）；都不行才是系统默认的 sizing（↖↘）。
+        self.grip = tk.Label(self.root, text="◣", font=self._font_at(10), bg=BG, fg=DIM)
+        for cur in ("size_ne_sw", "bottom_left_corner", "sizing"):
+            try:
+                self.grip.config(cursor=cur)
+                break
+            except Exception:
+                continue
+        self.grip.place(x=0, rely=1.0, anchor="sw")
+        for w in (self.root, self.grip):
+            w.bind("<ButtonRelease-1>", self._release)
+        for w in (self.root, self.head, self.row, self.calc,
+                  self.l_wind, self.l_ang, self.l_lat, self.l_lon,
+                  self.l_mul, self.l_eq, self.l_prod):
+            w.bind("<MouseWheel>", self._wheel)       # Windows / macOS
+            w.bind("<Button-4>", self._wheel)         # Linux 上滚
+            w.bind("<Button-5>", self._wheel)         # Linux 下滚
 
         self._place()
         Reader(self.q, self.stop).start()
@@ -558,22 +606,110 @@ class Overlay:
 
     # ---- 拖动 ----
     def _press(self, e) -> None:
+        if e.widget is self.grip:                     # 按在缩放把手上 → 这次是缩放，不是拖窗口
+            self._dx = self._dy = None
+            self._grip_from = (e.x_root, e.y_root,
+                               self.root.winfo_x() + self.cur_w, self.root.winfo_y())
+            try:
+                self.grip.grab_set()                  # 抓指针：拖出把手范围也不丢事件
+            except Exception:
+                pass
+            return
         if e.widget is self.ent:                      # 点输入框是要打字/选字，别把窗口拖走
             self._dx = self._dy = None
             return
         self._dx, self._dy = e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y()
 
     def _drag(self, e) -> None:
+        if self._grip_from is not None:               # 正在拖把手 → 缩放，别挪窗口
+            self._grip_drag(e)
+            return
         if self._dx is None:                          # 刚才按在输入框上，不当拖动
             return
         self.root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
 
+    def _release(self, e) -> None:
+        if self._grip_from is not None:
+            self._grip_from = None
+            try:
+                self.grip.grab_release()
+            except Exception:
+                pass
     def _focus_ent(self, e=None) -> None:
         """无边框置顶窗口不会自动拿键盘焦点：点一下输入框要主动要焦点，否则打不了字。"""
         try:
             self.root.after(1, self.ent.focus_force)
         except Exception:
             pass
+
+    # ---- 整窗缩放（长宽比固定：字号/间距/窗口一起按同一比例走）----
+    def _zoom(self, factor: float) -> None:
+        self._set_scale(self.scale * float(factor))
+
+    def _wheel(self, e) -> None:
+        delta = getattr(e, "delta", 0) or (120 if getattr(e, "num", 0) == 4 else -120)
+        self._zoom(SCALE_STEP if delta > 0 else 1.0 / SCALE_STEP)
+
+    def _grip_drag(self, e) -> None:
+        """
+        拖左下角把手缩放：**钉住右上角**（窗口默认就贴屏幕右上角），
+        目标宽度 = 右边缘 − 光标 x，目标高度 = 光标 y − 上边缘，取较大的一维定比例。
+        """
+        if not getattr(self, "_grip_from", None):
+            return
+        _, _, right, top = self._grip_from
+        w = max(40.0, right - e.x_root)
+        h = max(24.0, e.y_root - top)
+        self._set_scale(max(w / self.base_w, h / self.base_h))
+
+    def _set_scale(self, s: float, anchor: str = "right") -> None:
+        """
+        把整窗按 s 倍缩放：**字号、内边距、输入框宽度、窗口尺寸一起乘 s**。
+
+        一起乘的好处是长宽比天然不变（不用事后纠正），字也不会相对窗口变胖变瘦。
+        anchor="right" 时贴住右边缘（滚轮/菜单缩放时不会往左跑），"topleft" 时钉住左上角
+        （拖右下角把手时才符合手感）。
+        """
+        s = max(MIN_SCALE, min(MAX_SCALE, float(s)))
+        if abs(s - self.scale) < 1e-3:
+            return
+        self.scale = s
+        font = self._font_at(max(8, int(round(HEAD_SIZE * s))))
+        self.font = font
+        for w in (self.l_wind, self.l_ang, self.l_lat, self.l_lon,
+                  self.l_mul, self.l_eq, self.l_prod, self.ent):
+            w.config(font=font)
+        self.pad = max(0, int(round(PAD * s)))     # PAD 默认就是 0（窗口宽 = 第一行宽）
+        self.gap = max(2, int(round(GAP * s)))
+        self.head.pack_configure(padx=self.pad, pady=(max(1, int(round(6 * s))), 0))
+        self.row.pack_configure(padx=self.pad, pady=(0, max(1, int(round(8 * s)))))
+        self.calc.pack_configure(padx=self.pad, pady=(0, max(1, int(round(8 * s)))))
+        self.l_ang.pack_configure(padx=(self.gap, 0))
+        self.l_lon.pack_configure(padx=(self.gap, 0))
+        self.l_mul.pack_configure(padx=(self.gap, 0))
+        self.l_eq.pack_configure(padx=(self.gap, 0))
+        self.l_prod.pack_configure(padx=(self.gap, 0))
+        self.ent.pack_configure(padx=(self.gap, 0))
+        # 注意：**不要**在这里改输入框的 width。Tk 的 Entry(width=N) 单位是"字符数"，
+        # 跟着字体走；字体已经按 s 放大了一次，再乘一次 N 就会按 s² 涨（实测把 "=" 和
+        # 结果挤出窗口）。保持 4 个字符宽，像素宽度自然随字体等比变化。
+        try:
+            # 把手也随字号长，但封顶：放太大就成了个巨大的三角，难看
+            self.grip.config(font=self._font_at(min(16, max(8, int(round(10 * s))))))
+        except Exception:
+            pass
+        self.win_w = max(120, int(round(self.base_w * s)))
+        self.win_h = max(40, int(round(self.base_h * s)))
+        self.text_px = max(60, self.win_w - 2 * self.pad - 6)
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        x = self.root.winfo_x()
+        y = self.root.winfo_y()
+        if anchor == "right":                       # 贴住右边缘，缩放时窗口不会往左跑
+            x = self.root.winfo_x() + self.cur_w - self.win_w
+        x = max(0, min(int(x), max(0, sw - self.win_w)))
+        y = max(0, min(int(y), max(0, sh - self.win_h)))
+        self.cur_w, self.cur_h = self.win_w, self.win_h
+        self.root.geometry(f"{self.win_w}x{self.win_h}+{x}+{y}")
 
     def _calc(self) -> None:
         """
@@ -639,8 +775,8 @@ class Overlay:
         else:
             self.ok = True
             self._resize(self.win_w)          # 回到固定宽度
-            self.l_ang.pack_configure(padx=(GAP, 0))
-            self.l_lon.pack_configure(padx=(GAP, 0))
+            self.l_ang.pack_configure(padx=(self.gap, 0))
+            self.l_lon.pack_configure(padx=(self.gap, 0))
             w = st["wind"]
             # 大行：风向箭头 + 总风速 + 夹角（夹角中性色）
             # 小行：横向 / 纵向分量
@@ -686,19 +822,21 @@ class Overlay:
         单靠拆分或单靠加宽都治不了，配合着来才能"整句可见"。
         """
         base = self.win_w
-        for size in range(ERROR_SIZE, ERR_MIN_SIZE - 1, -2):
-            width = base - 2 * PAD - 8
+        step = max(1, int(round(2 * self.scale)))
+        for size in range(max(9, int(round(ERROR_SIZE * self.scale))),
+                          max(9, int(round(ERR_MIN_SIZE * self.scale))) - 1, -step):
+            width = base - 2 * self.pad - 8
             if self._fits2(text, size, width):
                 font = self._font_at(size)
                 line1, line2 = self._two_lines(text, font, width)
                 return font, line1, line2, base
-        font = self._font_at(ERR_MIN_SIZE)
+        font = self._font_at(max(9, int(round(ERR_MIN_SIZE * self.scale))))
         cap = max(base, int(self.root.winfo_screenwidth() * 0.90))
-        width = cap - 2 * PAD - 8
+        width = cap - 2 * self.pad - 8
         line1, line2 = self._two_lines(text, font, width)
         if font.measure(line2) > width:                   # 连屏幕 90% 都放不下 → 只能截断
             line2 = self._fit(line2, width, font)
-        need = max(font.measure(line1), font.measure(line2)) + 2 * PAD + 8
+        need = max(font.measure(line1), font.measure(line2)) + 2 * self.pad + 8
         return font, line1, line2, int(min(cap, max(base, need)))
 
     def _font_at(self, size: int) -> tkfont.Font:
@@ -756,7 +894,7 @@ class Overlay:
         sw = self.root.winfo_screenwidth()
         w = int(min(max(w, self.win_w), sw - 20))
         x = max(0, min(self.root.winfo_x() + self.cur_w - w, sw - w))
-        self.cur_w = w
+        self.cur_w, self.cur_h = w, self.win_h
         self.root.geometry(f"{w}x{self.win_h}+{int(x)}+{self.root.winfo_y()}")
 
     def _fit(self, text: str, limit: int | None = None, font=None) -> str:

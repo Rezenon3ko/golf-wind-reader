@@ -80,6 +80,7 @@ TOPFACE_MIN_FRAC = 0.25      # 窄带测角：切出的顶面至少占整块剪�
 TOPFACE_MAX_DEV = 35.0       # 顶面与整块剪影的轴(mod 180)差超过它 → 顶面碎了/取错了，退回剪影
 GLYPH_MIN_AREA_FRAC = 0.15   # 文字行里小于最大团块这个比例的碎墨直接丢（背景斜刺、面板网点、毛边）
 DISC_MASK_PAD = 1.10         # 箭头只在草地圆盘上；按固定版式圈盘面时外扩这么多（箭头尖只探出几像素）
+DISC_MASK_PAD_FIT = 1.25     # 有实测盘面几何时外扩这么多（箭头尖会探出盘沿，实测几何不会连带背景）
 DISC_COVER_FRAC = 0.50       # 预期圆盘椭圆里的草地覆盖率下限（定位兜底判据，见 _find_dial_by_prior）
 GRASS_GMARGIN = 15           # 草地判据
 GRASS_GMIN = 95
@@ -372,6 +373,10 @@ def _disc_ellipse(dial: Dial, shape: tuple[int, int], ss: float = 1.0,
     """
     a = CONFIG.disc_panel_ratio * dial.r * pad * ss
     b = a * dial.k
+    # 注意：这里**故意**仍用固定版式（不换成实测盘面几何）。实测过：掩膜范围一挪，
+    # 某些帧的尖端判据就会翻 180°（4 号帧翻过 188°），而 1.1.11 的固定范围在实机上
+    # 本来就准到 1° 以内 —— 别为了"更精确的中心"把已验证的行为搞坏。
+    # 实测盘面几何（dial.disc）只用来写日志/校准 k，不参与裁剪。
     cx = (dial.cx - box[0]) * ss
     cy = (dial.cy - 0.30 * dial.r * CONFIG.disc_panel_ratio - box[1]) * ss
     out = np.zeros(shape, dtype=bool)
@@ -402,6 +407,77 @@ def _disc_turf_coverage(rgb: np.ndarray, cx: float, cy: float, r: float, k: floa
     grass = _grass_mask(rgb[y0:y1, x0:x1], 25, 45, 140)
     n = int(inside.sum())
     return float((grass & inside).sum()) / n if n else 0.0
+
+
+def _disc_geometry(rgb: np.ndarray, dial: Dial) -> tuple | None:
+    """
+    实测盘面（草地圆）的椭圆：返回 (cx, cy, 半长轴, 半短轴)，失败返回 None。
+
+    只取**亮饱和绿**（盘面）而不是"最大绿块"：面板半透明，背景树/草地会漏进来，但它们被
+    面板压暗、或偏蓝，落在门槛外。逐列取上下沿 + 稳健（剔离群）拟合轴平行椭圆，箭头啃出的
+    缺口会变成离群点被丢掉（用外接框会被缺口带偏，同机位两帧能差 0.2）。
+    """
+    H, W = rgb.shape[:2]
+    r = dial.r
+    x0 = int(max(dial.cx - 1.45 * r, 0)); x1 = int(min(dial.cx + 1.45 * r, W))
+    y0 = int(max(dial.cy - 1.45 * r, 0)); y1 = int(min(dial.cy + 1.45 * r, H))
+    if x1 - x0 < 40 or y1 - y0 < 40:
+        return None
+    hs = rgb_to_hsv(rgb[y0:y1, x0:x1])          # 只算盘面这一小块（整幅 70ms，这块 ~4ms）
+    vivid = ((hs[..., 0] >= 70.0) & (hs[..., 0] <= 115.0)
+             & (hs[..., 1] >= 0.42) & (hs[..., 2] >= 0.50))
+    comps = label_components(vivid, min_area=max(120, int(0.05 * r * r)))
+    if not comps:
+        return None
+    c = max(comps, key=lambda z: z.area)
+    m = np.zeros_like(vivid)
+    m[c.y0:c.y1 + 1, c.x0:c.x1 + 1] = vivid[c.y0:c.y1 + 1, c.x0:c.x1 + 1]
+    for cc in label_components(~m, keep_pixels=True, min_area=1):    # 填洞（箭头盖住的部分）
+        px = np.asarray(cc.pixels, dtype=int)
+        if cc.x0 > 0 and cc.y0 > 0 and cc.x1 < m.shape[1] - 1 and cc.y1 < m.shape[0] - 1:
+            m[px[:, 1], px[:, 0]] = True
+    ys, xs = np.nonzero(m)
+    if len(xs) < 0.15 * (0.522 * r) ** 2 * math.pi:
+        return None
+    cols = np.unique(xs)
+    top = np.full(cols.max() + 1, np.inf)      # 用 ±inf 初值：np.minimum.at 遇 NaN 会一直传 NaN
+    bot = np.full(cols.max() + 1, -np.inf)
+    np.minimum.at(top, xs, ys.astype(float))
+    np.maximum.at(bot, xs, ys.astype(float))
+    cols = cols[np.isfinite(top[cols]) & np.isfinite(bot[cols])]
+    P = np.stack([np.concatenate([cols, cols]),
+                  np.concatenate([top[cols], bot[cols]])], axis=1)
+    cur, fit = P, None
+    for _ in range(4):
+        fit = fit_ellipse_axis_aligned(cur, iters=3)
+        if fit is None or len(cur) < 20:
+            break
+        a, b = fit["a"], fit["b"]
+        rr = np.sqrt(((P[:, 0] - fit["cx"]) / max(a, 1e-6)) ** 2
+                     + ((P[:, 1] - fit["cy"]) / max(b, 1e-6)) ** 2)
+        res = np.abs(rr - 1.0)
+        keep = res <= np.quantile(res, 0.75)
+        if keep.sum() < 20:
+            break
+        cur = P[keep]
+    if fit is None:
+        return None
+    return (float(fit["cx"]) + x0, float(fit["cy"]) + y0,
+            float(max(fit["a"], fit["b"])), float(min(fit["a"], fit["b"])))
+
+
+def measure_disc_k(rgb: np.ndarray, dial: Dial) -> float | None:
+    """
+    俯视压缩比 k = 盘面椭圆的短半轴/长半轴。用常数不行：k 是相机俯仰的函数，每个洞/每个
+    机位都不一样（实测同一机位 10 帧只有 ±0.003，但换机位就会变）。所以每次定位实测一次，
+    结果写进 dial.k；盘面几何（中心/长短轴）也一起存进 dial.disc，供掩膜限制复用。
+    """
+    g = _disc_geometry(rgb, dial)
+    if g is None:
+        return None
+    _, _, a, b = g
+    k = float(b / max(a, 1e-6))
+    return k if 0.55 <= k <= 1.0 else None
 
 
 def arrow_mask(hsv: np.ndarray) -> np.ndarray:
@@ -523,6 +599,7 @@ class Dial:
     r: float
     k: float = DEFAULT_K
     anchored_by: str = ""
+    disc: tuple | None = None     # 实测盘面 (cx, cy, 半长轴, 半短轴)；限制/校准都用它，见 _disc_geometry
 
 
 def _ring_coverage(pts: np.ndarray, cx: float, cy: float, nbins: int = 72) -> float:
@@ -892,6 +969,7 @@ def find_dials(rgb: np.ndarray, hsv: np.ndarray | None = None,
     """
     d0 = _find_dial_by_prior(rgb, verbose, side)
     if d0 is not None:
+        _calibrate_disc(rgb, d0, verbose)
         return [d0]
     if hsv is None:                      # 先验没命中才需要整帧 HSV
         hsv = rgb_to_hsv(rgb)
@@ -976,9 +1054,27 @@ def find_dials(rgb: np.ndarray, hsv: np.ndarray | None = None,
                 d.k = float(fit["k"])
     # 风盘整个都在画面里（贴边被裁掉一半的圆环不是风盘 —— 之前会把画面边缘的
     # 白色 UI 当成风盘，读出来一串乱七八糟的数字）
-    return [d for d in merged
+    good = [d for d in merged
             if (d.cx - d.r >= -0.05 * d.r and d.cx + d.r <= img_w + 0.05 * d.r
                 and d.cy - d.r >= -0.05 * d.r and d.cy + d.r <= img_h + 0.05 * d.r)]
+    # 统一校准俯视压缩比 k：用盘面实测值，不再吃写死的常数（见 measure_disc_k 注释）。
+    for d in good:
+        _calibrate_disc(rgb, d, verbose)
+    return good
+
+
+def _calibrate_disc(rgb: np.ndarray, dial: Dial, verbose: bool = False) -> None:
+    """实测盘面椭圆：k 写进 dial.k，几何（中心/长短轴）写进 dial.disc 供限制复用。"""
+    g = _disc_geometry(rgb, dial)
+    if g is None:
+        return
+    _, _, a, b = g
+    k = float(b / max(a, 1e-6))
+    if not (0.55 <= k <= 1.0):
+        return
+    if verbose and abs(k - dial.k) > 0.005:
+        print(f"[定位] 盘面实测 k={k:.3f}（原 {dial.k:.3f}） 中心=({g[0]:.0f},{g[1]:.0f})")
+    dial.disc, dial.k = g, k
 
 
 # --------------------------------------------------------------------------
@@ -993,6 +1089,7 @@ class ArrowReading:
     n_pixels: int = 0
     tip: tuple = (0.0, 0.0)
     tail: tuple = (0.0, 0.0)
+    source: str = ""             # 这次用了哪张掩膜（顶面/剪影）—— 排查"读数偏南/偏北"要看它
 
 
 def _bbox_gap(a: "Component", b: "Component") -> float:
@@ -1186,6 +1283,74 @@ def _otsu_threshold(values: np.ndarray, nbins: int = 64) -> float:
     return float((edges[k] + edges[k + 1]) / 2.0)
 
 
+def _pick_elongated(mask: np.ndarray, rr: float,
+                    min_elong: float = 1.5, min_solid: float = 0.0):
+    """
+    通用掩膜的取块：按形状打分（细长 × 实心 × 面积），返回该块的像素（超采样坐标）。
+
+    为什么需要：色带（色相）是采集链最容易改坏的东西（洗淡、偏色、数字读错拿了别的档也
+    会拿错色带）。"盘面内 + 高饱和 + 不是盘面草绿"这个判据不依赖具体色相，箭头一定落进来，
+    剩下的就是把背景的圆斑/弥散块剔掉 —— 箭头是**细长**的，草斑和面板残留都不细长。
+    """
+    comps = label_components(mask, keep_pixels=True,
+                             min_area=max(30, int(0.004 * math.pi * rr * rr)))
+    best, best_score = None, 0.0
+    for c in comps:
+        if c.area < 0.006 * math.pi * rr * rr:
+            continue
+        pts = np.asarray(c.pixels, dtype=float)
+        X = pts - pts.mean(axis=0)
+        w = np.linalg.eigvalsh(X.T @ X / max(len(X), 1))
+        if w[0] <= 1e-9:
+            continue
+        elong = float(w[1] / w[0])
+        if elong < min_elong:                 # 圆斑/弥散块（草地、树影、面板残留）直接排除
+            continue
+        solid = c.area / float(max(c.w * c.h, 1))
+        if solid < min_solid:
+            continue
+        score = elong * min(solid, 1.0) * math.log1p(c.area)
+        if score > best_score:
+            best_score, best = score, c
+    return None if best is None else np.asarray(best.pixels, dtype=float)
+
+
+def measure_arrow_generic(rgb: np.ndarray, dial: Dial, k: float | None = None,
+                          supersample: int = 2) -> ArrowReading | None:
+    """
+    兜底测角：**完全不看色相**，在草地圆盘范围内找"高饱和、且不是盘面草绿"的细长块。
+
+    什么时候用：紧色带和放宽色带都找不到箭头（"风速读得出、θ=None"）。常见原因是采集链
+    把色相/饱和度改了、或风速数字读错导致拿了别的档的色带。这个判据不依赖具体色相，
+    只要求"盘面上那块明显细长的饱和区域"——箭头必然满足，背景草斑/面板残留不满足。
+    """
+    img = Image.fromarray(rgb)
+    box = _dial_box(dial, rgb.shape)
+    ss = max(1, int(supersample or 2))
+    crop = img.crop(box)
+    big = crop.resize((crop.width * ss, crop.height * ss), Image.LANCZOS)
+    hb = rgb_to_hsv(np.asarray(big))
+    cxs, cys = (dial.cx - box[0]) * ss, (dial.cy - box[1]) * ss
+    rr = dial.r * ss * 0.97
+    yy, xx = np.mgrid[0:hb.shape[0], 0:hb.shape[1]]
+    inside = ((xx - cxs) ** 2 + (yy - cys) ** 2) <= rr * rr
+    on_disc = _disc_ellipse(dial, hb.shape[:2], ss=ss, box=box)
+    grassish = ((hb[..., 0] >= 70.0) & (hb[..., 0] <= 115.0) & (hb[..., 1] >= 0.45))
+    generic = inside & on_disc & (hb[..., 1] >= 0.30) & (hb[..., 2] >= 0.45) & ~grassish
+    P = _pick_elongated(generic, rr, min_elong=2.0, min_solid=0.35)
+    if P is None or len(P) < 60 * ss * ss:
+        return None
+    P = P / ss + np.array([box[0], box[1]])
+    theta, samples = estimate_direction_ground(P, dial.k if k is None else k)
+    if not samples:
+        return None
+    phi = true_to_apparent(theta, dial.k if k is None else k)
+    tip, tail = _tip_tail_points(P, phi)
+    return ArrowReading(phi=phi, conf=float(samples.get("conf", 1.0)), phi_samples=samples,
+                        n_pixels=int(round(len(P) / (ss * ss))), tip=tip, tail=tail,
+                        source="通用掩膜")
+
+
 def measure_arrow(rgb: np.ndarray, hsv: np.ndarray, dial: Dial,
                   supersample: int = 6,
                   band: tuple[float, float, float, float] | None = None) -> ArrowReading | None:
@@ -1251,6 +1416,7 @@ def measure_arrow(rgb: np.ndarray, hsv: np.ndarray, dial: Dial,
         return None
     phi, samples = estimate_direction(P_sil)          # 兜底估计：整块剪影（屏幕空间）
     P_use = P_sil
+    src = "剪影"
     if band is not None:
         # 正常路（风速已读出 ⇒ 箭头颜色已知）：用 Otsu 自适应分界把窄带剪影切成"亮顶面 /
         # 暗侧壁"，能用顶面就用顶面（见函数注释），并且**在去压缩平面上定尖端**。
@@ -1259,18 +1425,40 @@ def measure_arrow(rgb: np.ndarray, hsv: np.ndarray, dial: Dial,
         dark = clip & ~bright
         ys_b = np.nonzero(bright)[0]
         ys_d = np.nonzero(dark)[0]
-        # 侧壁永远铺在顶面下缘 ⇒ 亮面质心该在暗面之上；反过来多半是光照/色彩异常，不敢用
-        lit_on_top = (not ys_d.size) or (ys_b.size and ys_b.mean() < ys_d.mean())
-        P_top = pick(bright) if lit_on_top else None
-        if P_top is not None and len(P_top) >= 60 and len(P_top) >= TOPFACE_MIN_FRAC * len(P_sil):
-            theta_top, samples_top = estimate_direction_ground(P_top, dial.k)
+        # 侧壁永远铺在顶面下缘 ⇒ 亮面质心该在暗面之上；反过来多半是光照/色彩异常，不敢用。
+        # strict = 严格判据（旧行为）；relaxed = 留一点容差 —— Otsu 有时把顶面自己也切成
+        # 两半（亮的一半 + 暗的一半 + 侧壁），质心只差零点几像素，这种"打平"不该判成翻转。
+        lit_on_top = ((not ys_d.size) or (not ys_b.size)
+                      or ys_b.mean() < ys_d.mean())
+        lit_tie = ((not ys_d.size) or (not ys_b.size)
+                   or ys_b.mean() <= ys_d.mean() + 0.05 * rr)
+        theta_sil = apparent_to_true(phi, dial.k) if samples else None
+
+        def _topface(is_tie: bool):
+            """试一版亮顶面；不满足判据就返回 None（调用方再退剪影）。"""
+            cand = pick(bright)
+            if cand is None or len(cand) < 60 or len(cand) < TOPFACE_MIN_FRAC * len(P_sil):
+                return None
+            th, sm = estimate_direction_ground(cand, dial.k)
+            if not sm:
+                return None
             # 顶面与整块剪影的**轴**（mod 180）差太多 ⇒ 顶面碎了/取错了，不冒险
-            theta_sil = apparent_to_true(phi, dial.k) if samples else None
-            agrees = (theta_sil is None
-                      or _ang_gap(theta_top % 180.0, theta_sil % 180.0) <= TOPFACE_MAX_DEV)
-            if samples_top and agrees:
-                P_use, samples = P_top, samples_top
-                phi = true_to_apparent(theta_top, dial.k)   # 换回画面角，下游照旧走 apparent_to_true
+            if (theta_sil is not None
+                    and _ang_gap(th % 180.0, theta_sil % 180.0) > TOPFACE_MAX_DEV):
+                return None
+            # "打平"档（Otsu 把顶面自己切成亮暗两半）多一道关：朝向必须与剪影一致。
+            # 实机反证过：朝向不一致时（7 号帧差 174°）剪影的朝向才是对的，赌错就是 180°。
+            if is_tie and theta_sil is not None and _ang_gap(th, theta_sil) > 90.0:
+                return None
+            return cand, th, sm
+
+        got = _topface(False) if lit_on_top else None
+        if got is None and lit_tie:
+            got = _topface(True)
+        if got is not None:
+            P_use, theta_top, samples = got
+            phi = true_to_apparent(theta_top, dial.k)   # 换回画面角，下游照旧走 apparent_to_true
+            src = "顶面"
     else:
         P_top = pick(topf)
         use_top = dial.kind == KIND_GAUGE
@@ -1284,7 +1472,7 @@ def measure_arrow(rgb: np.ndarray, hsv: np.ndarray, dial: Dial,
     return ArrowReading(phi=phi, conf=float(samples.get("conf", 1.0)),
                         phi_samples=samples,
                         n_pixels=int(round(len(P_use) / (ss * ss))),  # 换算回原图尺度
-                        tip=tip, tail=tail)
+                        tip=tip, tail=tail, source=src)
 
 
 # --------------------------------------------------------------------------
@@ -1845,6 +2033,11 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
                 band = wind_color(fr.speed)
                 arrow = alt
             break
+    if arrow is None:
+        # 最后一招：完全不看色相，在盘面里找"高饱和、非草绿、明显细长"的那块（见函数注释）。
+        # 放在最后是为了不动已验证的路径：紧色带/放宽色带能读的帧，行为与之前完全一致。
+        if band is not None:
+            arrow = measure_arrow_generic(rgb, dial, supersample=ss)
     if arrow is None:
         if mismatch:
             fr.message = "箭头颜色与风速数字对不上（数字读错？）"
