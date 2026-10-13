@@ -1963,6 +1963,9 @@ class FrameReading:
     theta: float | None = None
     wind: dict = field(default_factory=dict)
     ocr: dict | None = None
+    arrow_band: tuple | None = None    # 箭头**实际量到**的颜色档（不是数字推出来的那个档）
+    # ↑ 用途：风速锁定的"安全网"要拿它跟锁定档比 —— 箭头颜色是量出来的，比细笔画数字可信；
+    #   通用掩膜那条路量不出颜色，这里是 None（表示"这拍不知道箭头什么颜色"）。
 
 
 def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
@@ -2048,6 +2051,9 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
         # 再谈"是不是另一种颜色"。实测这就是"风速读得出、箭头找不到"的主因。
         arrow = measure_arrow(rgb, hsv, dial, supersample=ss, band=_relax_band(band))
     mismatch = False
+    # 箭头实际量到的颜色档：正常路/放宽路就是 band，颜色对不上改走别档时在下面被改写，
+    # 通用掩膜（不看色相）那条路量不出颜色，保持 None。
+    arrow_band = band if arrow is not None else None
     if arrow is None and band is not None and do_ocr:
         # 这一档的箭头没找到 → 探一下盘里是不是"另一种颜色"的箭头。
         # 箭头是盘里最大的一块纯色，比那两三个细笔画数字可靠得多：如果它是别的颜色，
@@ -2065,14 +2071,22 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
             ocr2 = ocr_speed(rgb, dial, state=ocr_state, boxes=boxes,
                              allow=lambda v, lo=lo, hi=hi: lo <= v <= hi,
                              best_effort=True)
+            arrow, arrow_band = alt, full        # 箭头是**量**出来的，比数字可信，先认它
             if ocr2.get("value") is not None:
                 fr.ocr = ocr2
                 fr.speed = float(ocr2["value"])
                 fr.speed_note = "?"                 # 这条是"跟箭头颜色对不上、换一档重读"来的，存疑
                 fr.cands.append([int(ocr2["value"]), float(ocr2.get("conf") or 0.0),
                                  False, band_name(full)])
-                band = wind_color(fr.speed)
-                arrow = alt
+                band = wind_color(fr.speed) or full
+            else:
+                # 箭头颜色明确落在这一档，但数字在这一档里读不出来 —— 那刚才读到的那个数字
+                # 就是**自相矛盾**的：品红箭头 ⇒ 只可能是 11~15，绝不可能读出 1。
+                # 以前这里保留那个数字、箭头换成"通用掩膜"，结果窗口显示 1 m/s 而游戏是 13。
+                # 现在丢掉那个数字，风速降级成区间显示（方向照给），也不能给一个跟箭头打架的数。
+                # band 也必须改成它 —— 后面 speed_range 是按 band 取的（漏了这步就会出现
+                # "区间显示 1-5、箭头却是黄档"这种自相矛盾）。
+                fr.speed, fr.speed_note, band = None, "", full
             break
     if arrow is None:
         # 最后一招：完全不看色相，在盘面里找"高饱和、非草绿、明显细长"的那块（见函数注释）。
@@ -2090,6 +2104,7 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
     k = dial.k
     theta = apparent_to_true(arrow.phi, k)
     fr.ok, fr.arrow, fr.phi, fr.k, fr.theta = True, arrow, arrow.phi, k, theta
+    fr.arrow_band = arrow_band
     if fr.speed is None:
         # 数字读不出、但箭头颜色认出来了：风速**降级成区间**显示，方向照样给（分量算不了）。
         # 这就是"数字置信度低/读不出"时窗口该有的样子：`11-15 m/s` + 风向箭头。

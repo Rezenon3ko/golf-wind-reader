@@ -421,11 +421,12 @@ class Recognizer:
         self.turn_run = 0                # 连续几拍大幅变化（≥2 判定为真在转视角）
         # ---- 风速锁定（同一洞风速固定）----
         self.locked: float | None = None  # 锁定的风速；None = 未锁（正在测）
-        self.best: tuple[float, float] | None = None   # 本轮"正常测量"里置信度最高的一拍 (conf, speed)
+        self.votes: dict[int, list] = {}               # 本轮测量：读数 -> [出现次数, 置信度之和]
         self.measure_t0: float | None = None           # 本轮测量的起点（第一次看到风向盘的时刻）
         self.dial_t: float | None = None               # 上一次看到风向盘的时刻（用来算"消失多久"）
         self.break_run = 0                             # 独立读数落在"另一档"的连续拍数（安全网）
         self.lock_event = ""                           # 状态切换时留一句话，交给日志（每帧清空）
+        self.lock_mismatch = ""                        # 锁定值与这一拍独立读数打架时的说明（每帧清空）
         self.ocr = W.OcrState()          # 字形模板库状态独立
         n = W.load_glyph_bank(GLYPH_BANK, state=self.ocr)
         if not n:
@@ -460,34 +461,53 @@ class Recognizer:
         """
         风速锁定状态机（只在"这一帧确实看到风向盘"时调一次）。
 
-        怎么锁：看到风向盘后先**正常测 WIND_MEASURE_S 秒**，把这几拍里**置信度最高**的
-        那个读数定下来 —— 同一洞风速固定，"读得最像的那一拍"就是对这一洞最可信的估计。
+        怎么锁：看到风向盘后先**正常测 WIND_MEASURE_S 秒**，把这 5 秒里的读数按**值**归并，
+        取"置信度之和"最高的那个值锁住 —— 也就是 票数 × 平均置信度。
 
-        锁定期间**仍然每帧独立读一遍数字**（不省这一步），但只当安全网用：独立读数连续
-        LOCK_BREAK_RUN 拍都落在**另一个颜色档**（箭头颜色都变了）⇒ 多半已经换洞、只是
-        风向盘没消失够久 ⇒ 解锁重测。只比"档"不比具体数值：数字误读一般发生在同一档内
-        （6/7/8 都是黄档），不该拿它去推翻锁定；真换洞时箭头颜色往往也跟着换。
+        为什么不是"单拍置信度最高"：单拍高分可能正好是误读。按"和"排就好：读得又多又像的
+        那个值赢。
+        为什么不是"纯平均置信度"：纯平均会让**只出现一次的高分误读**压过**连续出现 8 次的
+        正确值**（0.95 > 0.86），所以次数必须带进去算。
+
+        锁定期间**仍然每帧独立读一遍数字**（不省这一步），但只当安全网用：
+          · 首选拿 **fr.arrow_band（箭头实际量到的颜色档）**跟锁定档比 —— 箭头是一大块纯色，
+            比两三个细笔画数字可信得多；连续 LOCK_BREAK_RUN 拍落在另一个档 ⇒ 多半换洞了。
+          · 箭头是"通用掩膜"量的（量不出颜色）时，才退回用数字推出来的档。
         """
         now = time.time()
         if self.locked is None:
             if self.measure_t0 is None:
                 self.measure_t0 = now                 # 第一次看到风盘 → 本轮测量开始
-            conf = float((fr.ocr or {}).get("conf") or 0.0)
-            if fr.speed is not None and (self.best is None or conf > self.best[0]):
-                self.best = (conf, float(fr.speed))
-            if self.best is not None and now - self.measure_t0 >= WIND_MEASURE_S:
-                self.locked, self.break_run = self.best[1], 0
-                self.lock_event = (f"风速锁定 {self.locked:g} m/s"
-                                   f"（前 {WIND_MEASURE_S:g}s 置信度最高的一拍，"
-                                   f"{self.best[0]:.2f}）")
+            if fr.speed is not None:                  # 没读出数字的这一拍不进票（只有区间）
+                conf = float((fr.ocr or {}).get("conf") or 0.0)
+                slot = self.votes.setdefault(int(round(fr.speed)), [0, 0.0])
+                slot[0] += 1
+                slot[1] += conf
+            if self.votes and now - self.measure_t0 >= WIND_MEASURE_S:
+                v, (n, s) = max(self.votes.items(), key=lambda kv: (kv[1][1], kv[1][0]))
+                self.locked, self.break_run = float(v), 0
+                losers = "、".join(f"{k}({c[0]}拍/Σ{c[1]:.2f})"
+                                   for k, c in sorted(self.votes.items(),
+                                                      key=lambda kv: -kv[1][1]) if k != v)
+                self.lock_event = (f"风速锁定 {v} m/s（前 {WIND_MEASURE_S:g}s 里 "
+                                   f"{n} 拍读到它、置信度和 {s:.2f} 最高"
+                                   + (f"；其它 {losers}" if losers else "") + "）")
             return
+        # ---- 已锁定：这一拍的独立读数只当安全网 ----
         band_lock = W.wind_color(self.locked)
-        band_now = W.wind_color(fr.speed) if fr.speed is not None else None
+        band_now = fr.arrow_band                        # 首选：箭头实际量到的颜色档
+        if band_now is None and fr.speed is not None:
+            band_now = W.wind_color(fr.speed)           # 退路：通用掩膜量不出颜色时用数字推
+        self.lock_mismatch = ""
         if band_now is not None and band_now != band_lock:
             self.break_run += 1
+            self.lock_mismatch = (f"锁定 {self.locked:g} m/s（{W.band_name(band_lock)}档），"
+                                  f"但这一拍的箭头是 {W.band_name(band_now)}档"
+                                  f"（数字读出 {fr.speed if fr.speed is not None else '—'}）")
             if self.break_run >= LOCK_BREAK_RUN:
                 self.lock_event = (f"独立读数连续 {self.break_run} 拍落在另一档"
-                                   f"（锁定 {self.locked:g} → 现在读 {fr.speed:g}）"
+                                   f"（锁定 {self.locked:g} → 现在箭头是 "
+                                   f"{W.band_name(band_now)}档）"
                                    f"⇒ 判定换洞，解锁重测")
                 self._unlock()
         else:
@@ -496,9 +516,10 @@ class Recognizer:
     def _unlock(self) -> None:
         """解锁：回到"重新测量"状态，等风向盘下次出现再锁一次。"""
         self.locked = None
-        self.best = None
+        self.votes = {}
         self.measure_t0 = None
         self.break_run = 0
+        self.lock_mismatch = ""
 
     def _wind_gone(self) -> None:
         """
@@ -524,6 +545,7 @@ class Recognizer:
     def recognize(self, rgb) -> dict:
         t0 = time.time()
         self.lock_event = ""                      # 每帧清空：状态切换的那一句话只报一次
+        self.lock_mismatch = ""                    # 同上：锁定值与这一拍打架的说明
         h, w = rgb.shape[:2]
         if self.dial is None or self.shape != (h, w):
             if time.time() - self.last_locate_t < RELOCATE_S:
@@ -599,6 +621,8 @@ class Recognizer:
                 "speed_note": fr.speed_note, "speed_range": fr.speed_range,
                 "cands": fr.cands,
                 "speed_locked": self.locked is not None, "lock_event": self.lock_event,
+                "lock_mismatch": self.lock_mismatch,
+                "arrow_band": fr.arrow_band,
                 "latency_ms": (time.time() - t0) * 1000.0}
 
     # ---- 抖动抑制：静止时取平均并定住 ----

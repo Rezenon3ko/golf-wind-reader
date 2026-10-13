@@ -386,6 +386,8 @@ class Reader(threading.Thread):
                             f"{v}{'' if strong else '~'}({_num(s, '.2f')},{n or '无档'})"
                             for v, s, strong, n in cands[:4])
                     where += " 锁定=" + (_num(sp_val) if st.get("speed_locked") else "未")
+                    if st.get("lock_mismatch"):
+                        where += f" 独立={st['lock_mismatch']}"
                 ocr = st.get("ocr") or {}
                 if ocr.get("box"):
                     where += f" 数字框{ocr['box']}"
@@ -406,6 +408,11 @@ class Reader(threading.Thread):
             # 否则 3 个名额会被一堆废帧占满。
             # ↑ 1.1.22：这里原先把 not st.get("ok") 漏了，于是"开跑前 6 个定位到风盘的帧"
             #   就把名额全占满（哪怕那几帧识别得好好的），真出问题时反而没图可看。
+            self._dump(rgb, st)
+        elif st.get("lock_mismatch"):
+            # 锁着某个风速，但这一拍独立量出来的**箭头颜色档**跟锁定档打架 ——
+            # 这正好是"锁定错了 / 换洞了 / 认错颜色"的现场证据，存帧供离线查。
+            self._log(f"锁定与独立读数不一致：{st['lock_mismatch']}")
             self._dump(rgb, st)
         if st.get("ok"):
             self.have_good, self.last_ok, self.bad = True, time.time(), 0
