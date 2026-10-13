@@ -75,11 +75,17 @@ DEFAULT_K = CONFIG.k_default
 CYAN_H = (158.0, 218.0)      # 兼容旧判据
 CYAN_S = 0.15
 CYAN_V = 0.42
-TOPFACE_V = 0.80             # 箭头"顶面"（明亮面）的亮度下限（只在没有颜色线索的兜底路上用）
-TOPFACE_MIN_FRAC = 0.25      # 窄带测角：切出的顶面至少占整块剪影这么多，才够 PCA 定方向
-TOPFACE_MAX_DEV = 35.0       # 顶面与整块剪影的轴(mod 180)差超过它 → 顶面碎了/取错了，退回剪影
+# 下面两个是 1.1.20 之前"按亮度切箭头顶面"用的阈值，那条路已停用（见 measure_arrow）；
+# 留着是为了对照历史日志，不要在新代码里引用。
+TOPFACE_V = 0.80             # 箭头"顶面"（明亮面）的亮度下限（只剩 band=None 的兜底路在用）
+TOPFACE_MIN_FRAC = 0.25      # （停用）切出的顶面至少要占整块剪影这么多
+TOPFACE_MAX_DEV = 35.0       # （停用）顶面与整块剪影的轴(mod 180)容差
 GLYPH_MIN_AREA_FRAC = 0.15   # 文字行里小于最大团块这个比例的碎墨直接丢（背景斜刺、面板网点、毛边）
-DISC_MASK_PAD = 1.10         # 箭头只在草地圆盘上；按固定版式圈盘面时外扩这么多（箭头尖只探出几像素）
+DISC_MASK_PAD = 1.45         # 箭头只在草地圆盘上；按固定版式圈盘面时外扩这么多。
+# ↑ 为什么是 1.45：箭头会**探出草地圆盘**（实测箭头尖超出盘沿 0.15r 左右），
+#   掩膜太小会把尖端切掉 —— 尖端一丢，"哪头是尖"就靠残缺口径抖，实测同一静止
+#   画面 θ 在 341~351° 之间跳（极差 9.95°）。放宽到 1.45 后同一批帧 θ 极差 0.48°。
+#   注意固定版式的盘心比实测盘心低约 0.08r，所以这里要比"实测几何"那条路更宽一点。
 DISC_MASK_PAD_FIT = 1.25     # 有实测盘面几何时外扩这么多（箭头尖会探出盘沿，实测几何不会连带背景）
 DISC_COVER_FRAC = 0.50       # 预期圆盘椭圆里的草地覆盖率下限（定位兜底判据，见 _find_dial_by_prior）
 GRASS_GMARGIN = 15           # 草地判据
@@ -1139,15 +1145,15 @@ def _width_profile(P: np.ndarray, axis: np.ndarray, nb: int = 24):
 
 def _orient_by_width_jump(P: np.ndarray, axis_mod180: float):
     """
-    三判据投票判断尖端在哪一端，返回 (φ, 置信度)。
+    两判据投票判断尖端在哪一端，返回 (φ, 置信度)。
 
     置信度 = 加权得分 / 权重之和（0~1）。箭头斜置、被高光切成两块或只剩
-    半截时，三个判据会互相矛盾，此时置信度很低 —— 调用方可以据此按住
+    半截时，两个判据会互相矛盾，此时置信度很低 —— 调用方可以据此按住
     上一次的方向，避免"顺逆风偶尔反一下"。
     """
     a = math.radians(axis_mod180)
     axis = np.array([math.cos(a), math.sin(a)])
-    _, w, _ = _width_profile(P, axis)
+    t, w, c = _width_profile(P, axis)
     nb = len(w)
     if nb < 6 or w.max() <= 0:
         return None
@@ -1155,16 +1161,25 @@ def _orient_by_width_jump(P: np.ndarray, axis_mod180: float):
     i_max = int(np.argmax(w))
     mid = (nb - 1) / 2.0
     votes = []                                   # 每项 = (方向, 置信 0~1)
-    d_end = w[0] - w[-1]
-    if abs(d_end) > 0.08 * wmax:
-        votes.append((1 if d_end < 0 else -1, min(1.0, abs(d_end) / (0.25 * wmax))))
+    # 判据一：两端外 10% 处的**宽度包络**谁窄谁就是尖。
+    # 为什么不用"首/末单个 bin 的宽度"（旧写法）：箭头尾端是一段平边，但侧壁会把平边
+    # 两角往下拖出一小截，最后那一两个 bin 里往往只剩这点角，宽度从 ~0.4·w 掉到 ~0.2·w，
+    # 于是"越往尾越宽"的判据被顶反 —— 合成箭头实测 45° 这类斜向会整块判反 180°。
+    # 取外端 10% 的包络（而不是首末 bin）就把这种稀疏 bin 的噪声平均掉了。
+    nrm = np.array([-axis[1], axis[0]])
+    p = (P - c) @ nrm
+    lo_t, hi_t = float(t.min()), float(t.max())
+    span = max(hi_t - lo_t, 1e-9)
+    lo_sel, hi_sel = t <= lo_t + 0.10 * span, t >= hi_t - 0.10 * span
+    w_lo = float(p[lo_sel].max() - p[lo_sel].min()) if lo_sel.sum() > 1 else 0.0
+    w_hi = float(p[hi_sel].max() - p[hi_sel].min()) if hi_sel.sum() > 1 else 0.0
+    if w_lo > 0 and w_hi > 0 and abs(w_lo - w_hi) > 0.06 * wmax:
+        votes.append((1 if w_lo < w_hi else -1,
+                      min(1.0, abs(w_lo - w_hi) / max(w_lo, w_hi))))
+    # 判据二：最宽处在哪端 —— 箭头头部（宽）在尖端那一侧。
     d_peak = mid - i_max
     if abs(d_peak) > 0.08 * nb:
         votes.append((1 if d_peak > 0 else -1, min(1.0, abs(d_peak) / (0.25 * nb))))
-    jump_lo, jump_hi = float(w[1] - w[0]), float(w[-2] - w[-1])
-    d_jump = jump_lo - jump_hi
-    if abs(d_jump) > 0.05 * wmax:
-        votes.append((1 if d_jump > 0 else -1, min(1.0, abs(d_jump) / (0.15 * wmax))))
     if not votes:
         return None
     wsum = sum(v[1] for v in votes)
@@ -1262,6 +1277,9 @@ def _otsu_threshold(values: np.ndarray, nbins: int = 64) -> float:
 
     用来自适应地切出箭头顶面 —— 顶上"亮面 vs 侧壁"的**相对**亮度差在采集卡洗淡画面后
     基本不变，而写死的绝对亮度门槛（TOPFACE_V=0.80）会被洗淡一路带崩。
+
+    （1.1.20 起 measure_arrow 不再切顶面 —— 真机箭头表面有横向条纹，见那里的注释；
+    这个函数暂时没有调用方，留着是因为"洗淡画面下用相对阈值"的思路本身没问题。）
     """
     vals = np.asarray(values, dtype=np.float64)
     if vals.size < 32:
@@ -1358,11 +1376,9 @@ def measure_arrow(rgb: np.ndarray, hsv: np.ndarray, dial: Dial,
     测量箭头在画面上的指向 φ（0=正上，顺时针）。
     band 给定时用单色窄带掩膜取最大团块；band=None 时用多色宽带 + 形状打分（定位兜底）。
 
-    band 给定（正常路：风速已读出 ⇒ 箭头颜色已知）时，窄带剪影里通常**同时**含"亮顶面 +
-    暗侧壁"两层：侧壁沿着形状下缘铺一条，会把 PCA 往画面下方拽 —— 合成 3D 箭头实测侧壁
-    14px（箭头长 110px）时测角偏 2~5°、22px 时偏到 8°，且偏向随箭头朝向变化。顶面才是
-    平行于盘面、和 k 模型前提一致的那张面，所以能切出顶面就用顶面，切不出（顶面太碎/太暗）
-    才退回整块剪影。
+    1.1.20 起，band 给定的正常路**直接用整块窄带剪影**定方向（不再按亮度切"顶面"）：
+    本作箭头表面带横向条纹，全局亮度阈值切出来的是横带不是顶面，方向随之乱抖；
+    整块剪影只用"箭头自己的颜色 + 形状"，既不依赖背景亮度，帧间也稳（见下面 pass 处注释）。
     """
     img = Image.fromarray(rgb)
     box = _dial_box(dial, rgb.shape)          # 和 detect_arrow_band 用同一个裁剪框
@@ -1418,47 +1434,16 @@ def measure_arrow(rgb: np.ndarray, hsv: np.ndarray, dial: Dial,
     P_use = P_sil
     src = "剪影"
     if band is not None:
-        # 正常路（风速已读出 ⇒ 箭头颜色已知）：用 Otsu 自适应分界把窄带剪影切成"亮顶面 /
-        # 暗侧壁"，能用顶面就用顶面（见函数注释），并且**在去压缩平面上定尖端**。
-        thr = _otsu_threshold(hb[..., 2][clip])
-        bright = clip & (hb[..., 2] >= thr)
-        dark = clip & ~bright
-        ys_b = np.nonzero(bright)[0]
-        ys_d = np.nonzero(dark)[0]
-        # 侧壁永远铺在顶面下缘 ⇒ 亮面质心该在暗面之上；反过来多半是光照/色彩异常，不敢用。
-        # strict = 严格判据（旧行为）；relaxed = 留一点容差 —— Otsu 有时把顶面自己也切成
-        # 两半（亮的一半 + 暗的一半 + 侧壁），质心只差零点几像素，这种"打平"不该判成翻转。
-        lit_on_top = ((not ys_d.size) or (not ys_b.size)
-                      or ys_b.mean() < ys_d.mean())
-        lit_tie = ((not ys_d.size) or (not ys_b.size)
-                   or ys_b.mean() <= ys_d.mean() + 0.05 * rr)
-        theta_sil = apparent_to_true(phi, dial.k) if samples else None
-
-        def _topface(is_tie: bool):
-            """试一版亮顶面；不满足判据就返回 None（调用方再退剪影）。"""
-            cand = pick(bright)
-            if cand is None or len(cand) < 60 or len(cand) < TOPFACE_MIN_FRAC * len(P_sil):
-                return None
-            th, sm = estimate_direction_ground(cand, dial.k)
-            if not sm:
-                return None
-            # 顶面与整块剪影的**轴**（mod 180）差太多 ⇒ 顶面碎了/取错了，不冒险
-            if (theta_sil is not None
-                    and _ang_gap(th % 180.0, theta_sil % 180.0) > TOPFACE_MAX_DEV):
-                return None
-            # "打平"档（Otsu 把顶面自己切成亮暗两半）多一道关：朝向必须与剪影一致。
-            # 实机反证过：朝向不一致时（7 号帧差 174°）剪影的朝向才是对的，赌错就是 180°。
-            if is_tie and theta_sil is not None and _ang_gap(th, theta_sil) > 90.0:
-                return None
-            return cand, th, sm
-
-        got = _topface(False) if lit_on_top else None
-        if got is None and lit_tie:
-            got = _topface(True)
-        if got is not None:
-            P_use, theta_top, samples = got
-            phi = true_to_apparent(theta_top, dial.k)   # 换回画面角，下游照旧走 apparent_to_true
-            src = "顶面"
+        # 1.1.20：已知颜色这条路**直接用整块剪影**，不再用 Otsu 按亮度切"亮顶面"。
+        #
+        # 为什么废掉切顶面：本作箭头是**上下两截不同亮度**（侧壁暗、顶面亮），但赛道上的
+        # 真实箭头表面还带**横向条纹**（垂直长轴的明暗带）—— 按全局亮度阈值切，切出来的是
+        # 一条条横带而不是那张平顶面。这个条纹掩膜的 PCA 轴随帧抖，实测同一静止画面
+        # θ 在 347~355° 之间跳（极差 7.89°），而整块剪影只抖 0.48°。
+        # 侧壁确实会把轴往画面下方拽，但实测把剪影逐列底边往上削 2~8px（模拟去掉侧壁）
+        # θ 只动 0.15° —— 这个机位上侧壁对方向的影响远小于切顶面引入的抖动。
+        # （合成箭头那个"切顶面才准"的结论建立在顶面是均匀色的前提上，真机不成立。）
+        pass
     else:
         P_top = pick(topf)
         use_top = dial.kind == KIND_GAUGE
