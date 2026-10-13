@@ -89,6 +89,11 @@ RELOCATE_S = 1.5                   # 找不到风盘时的重试间隔（秒）
 RECONNECT_FAILS = 3                # 连续取帧失败这么多次就重连（顺便重新挑源）
 RELOCATE_BAD = 6                   # 连续这么多帧读不出来就丢掉缓存的定位，重新找一次
 HYST = 0.05                        # 横向/纵向 |值| 小于它就沿用上一次方向（0 附近不抖）
+
+# ---- 风速锁定：同一洞的风速是固定的，锁住它就不会因为某一拍数字读错而乱跳 ----
+WIND_MEASURE_S = 5.0               # 看到风向盘后先正常测这么久，再从这几拍里挑"置信度最高"的锁住
+WIND_UNLOCK_S = 30.0               # 风向盘消失超过这么久（时限，暂定）→ 判定进入下一洞 → 解锁重新测
+LOCK_BREAK_RUN = 6                 # 锁定期间"独立读数连续落在另一档"这么多拍 → 认为换洞了（安全网）
 FLIP_CONF = 0.6                    # 方向置信度低于此值时才做反 180° 保护
 FLIP_RUN = 3                       # 连续这么多次"反向"才认为真的转向了
 SMOOTH_A = 0.25                    # 角度指数平滑系数：越小越稳、越大越跟手
@@ -412,6 +417,13 @@ class Recognizer:
         self.ema: float | None = None    # 角度指数平滑值（压抖动）
         self.shown: float | None = None  # 当前显示的角度（带死区，静止时不动）
         self.turn_run = 0                # 连续几拍大幅变化（≥2 判定为真在转视角）
+        # ---- 风速锁定（同一洞风速固定）----
+        self.locked: float | None = None  # 锁定的风速；None = 未锁（正在测）
+        self.best: tuple[float, float] | None = None   # 本轮"正常测量"里置信度最高的一拍 (conf, speed)
+        self.measure_t0: float | None = None           # 本轮测量的起点（第一次看到风向盘的时刻）
+        self.dial_t: float | None = None               # 上一次看到风向盘的时刻（用来算"消失多久"）
+        self.break_run = 0                             # 独立读数落在"另一档"的连续拍数（安全网）
+        self.lock_event = ""                           # 状态切换时留一句话，交给日志（每帧清空）
         self.ocr = W.OcrState()          # 字形模板库状态独立
         n = W.load_glyph_bank(GLYPH_BANK, state=self.ocr)
         if not n:
@@ -441,15 +453,86 @@ class Recognizer:
         self.dial, self.shape, self.bad = None, None, 0
         self.ema = self.shown = None
 
+    # ---- 风速锁定：同一洞风速固定，锁住它就不会被单帧数字误读带跑 ----
+    def _update_lock(self, fr) -> None:
+        """
+        风速锁定状态机（只在"这一帧确实看到风向盘"时调一次）。
+
+        怎么锁：看到风向盘后先**正常测 WIND_MEASURE_S 秒**，把这几拍里**置信度最高**的
+        那个读数定下来 —— 同一洞风速固定，"读得最像的那一拍"就是对这一洞最可信的估计。
+
+        锁定期间**仍然每帧独立读一遍数字**（不省这一步），但只当安全网用：独立读数连续
+        LOCK_BREAK_RUN 拍都落在**另一个颜色档**（箭头颜色都变了）⇒ 多半已经换洞、只是
+        风向盘没消失够久 ⇒ 解锁重测。只比"档"不比具体数值：数字误读一般发生在同一档内
+        （6/7/8 都是黄档），不该拿它去推翻锁定；真换洞时箭头颜色往往也跟着换。
+        """
+        now = time.time()
+        if self.locked is None:
+            if self.measure_t0 is None:
+                self.measure_t0 = now                 # 第一次看到风盘 → 本轮测量开始
+            conf = float((fr.ocr or {}).get("conf") or 0.0)
+            if fr.speed is not None and (self.best is None or conf > self.best[0]):
+                self.best = (conf, float(fr.speed))
+            if self.best is not None and now - self.measure_t0 >= WIND_MEASURE_S:
+                self.locked, self.break_run = self.best[1], 0
+                self.lock_event = (f"风速锁定 {self.locked:g} m/s"
+                                   f"（前 {WIND_MEASURE_S:g}s 置信度最高的一拍，"
+                                   f"{self.best[0]:.2f}）")
+            return
+        band_lock = W.wind_color(self.locked)
+        band_now = W.wind_color(fr.speed) if fr.speed is not None else None
+        if band_now is not None and band_now != band_lock:
+            self.break_run += 1
+            if self.break_run >= LOCK_BREAK_RUN:
+                self.lock_event = (f"独立读数连续 {self.break_run} 拍落在另一档"
+                                   f"（锁定 {self.locked:g} → 现在读 {fr.speed:g}）"
+                                   f"⇒ 判定换洞，解锁重测")
+                self._unlock()
+        else:
+            self.break_run = 0                        # 同档、或这拍没读出来 → 清零
+
+    def _unlock(self) -> None:
+        """解锁：回到"重新测量"状态，等风向盘下次出现再锁一次。"""
+        self.locked = None
+        self.best = None
+        self.measure_t0 = None
+        self.break_run = 0
+
+    def _wind_gone(self) -> None:
+        """
+        这一拍没看到风向盘（在果岭推杆、球在飞、过场动画…）。
+
+        规矩：风向盘消失**超过时限** WIND_UNLOCK_S（暂定 30 秒）就当这一洞打完了
+        —— 一洞要所有玩家都打完才进下一洞，那个间隔通常远大于 30 秒 —— 于是解锁风速，
+        等下次看见风向盘重新测。没超时限的就是"同一洞里的短暂消失"（挥杆/走位），锁定保持。
+        """
+        now = time.time()
+        if self.dial_t is None:
+            self.dial_t = now
+            return
+        gone = now - self.dial_t
+        if gone <= WIND_UNLOCK_S:
+            return
+        self.dial_t = now                             # 重置，免得后面每拍都重复判一次
+        if self.locked is not None:
+            self.lock_event = (f"风向盘消失 {gone:.0f}s（>{WIND_UNLOCK_S:g}s）"
+                               f"⇒ 判定进入下一洞，解锁风速")
+        self._unlock()
+
     def recognize(self, rgb) -> dict:
         t0 = time.time()
+        self.lock_event = ""                      # 每帧清空：状态切换的那一句话只报一次
         h, w = rgb.shape[:2]
         if self.dial is None or self.shape != (h, w):
             if time.time() - self.last_locate_t < RELOCATE_S:
-                return {"ok": False, "message": "未找到风盘"}
+                self._wind_gone()
+                return {"ok": False, "message": "未找到风盘",
+                        "speed_locked": self.locked is not None, "lock_event": self.lock_event}
             self.last_locate_t = time.time()
             if not self.locate(rgb):
-                return {"ok": False, "message": "未找到风盘"}
+                self._wind_gone()
+                return {"ok": False, "message": "未找到风盘",
+                        "speed_locked": self.locked is not None, "lock_event": self.lock_event}
 
         d = self.dial
         assert d is not None
@@ -469,17 +552,37 @@ class Recognizer:
                 self.ema = self.shown = None
                 if self.args.verbose:
                     print("\n[定位] 连续读不出来 → 丢弃缓存，重新定位")
+            # 读不出来也可能是"风盘已经不在了"（在果岭推杆 / 球在飞）→ 走消失计时
+            self._wind_gone()
         if fr.ocr is not None and fr.ocr.get("value") is None and self.args.verbose:
             print("\n[风读] 未读出风速（等待下一次读取）")
         if fr.speed is None and not fr.speed_range:
             return {"ok": False, "message": "风速未识别（等待下一次读取）",
-                    "dial": d, "ocr": fr.ocr}
+                    "dial": d, "ocr": fr.ocr,
+                    "speed_locked": self.locked is not None, "lock_event": self.lock_event}
         if fr.no_wind:
             self.no_wind = True
+            self.dial_t = time.time()             # 0 m/s 也是"风盘在"：别把它算成消失
+            if self.locked is not None:
+                # 锁着 7 m/s 却读到 0 m/s：同一洞风速不会变，所以这基本只有两种可能 ——
+                # 真换洞了（新洞无风），或者数字被读成了 0。两种情况都该解锁重测。
+                self.lock_event = (f"读到 0 m/s（盘里没有风向箭头）⇒ 解锁风速"
+                                   f"（原先锁的是 {self.locked:g}）")
+                self._unlock()
             return {"ok": True, "no_wind": True, "speed": 0.0, "dial": d,
-                    "message": fr.message}
+                    "message": fr.message,
+                    "speed_locked": False, "lock_event": self.lock_event}
         if not fr.ok:
-            return {"ok": False, "message": fr.message, "speed": fr.speed, "dial": d}
+            return {"ok": False, "message": fr.message, "speed": fr.speed, "dial": d,
+                    "speed_locked": self.locked is not None, "lock_event": self.lock_event}
+
+        # ---- 这一帧确实看到了风向盘：先更新锁定状态，再用锁定值覆盖风速 ----
+        self.dial_t = time.time()
+        self._update_lock(fr)
+        if self.locked is not None:
+            # 锁上了：风速用锁定值（数字这一拍读成什么、读没读出来都不影响显示），
+            # 方向照常每帧实测 —— θ 是"相对瞄准方向"的夹角，本来就会跟着转身变化。
+            fr.speed, fr.speed_note, fr.speed_range = self.locked, "", None
 
         # 反 180° 保护 → 静止取平均（抖动抑制）
         theta = self._flip_guard(fr.theta, fr.arrow.conf if fr.arrow else 1.0)
@@ -493,6 +596,7 @@ class Recognizer:
                 # speed_range 表示只认出颜色档（显示成 "6-10 m/s"，分量算不了）；cands 供日志排查
                 "speed_note": fr.speed_note, "speed_range": fr.speed_range,
                 "cands": fr.cands,
+                "speed_locked": self.locked is not None, "lock_event": self.lock_event,
                 "latency_ms": (time.time() - t0) * 1000.0}
 
     # ---- 抖动抑制：静止时取平均并定住 ----

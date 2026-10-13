@@ -191,6 +191,7 @@ SCALE_STEP = 1.1               # 滚轮/菜单每次缩放比例
 # 拿它量才不会被"换了方向就顶出窗口"咬到（1.1.20 实测过：用 ↘ 量，换成 → 会差 6px）。
 SAMPLES = (("→  15 m/s", "+179.9°", "→ 13.55", "↑ 13.55"),   # 正常结果的最宽一拍
            ("→  11-15 m/s", "+179.9°", "", ""),               # 只认出颜色档：三段区间里最长的 11-15
+           ("→  15 m/s 锁", "+179.9°", "→ 13.55", "↑ 13.55"),  # 风速锁定：数字后面多一个"锁"
            ("·  0 m/s（无风）", "", "", ""))                   # 无风提示
 
 
@@ -353,20 +354,26 @@ class Reader(threading.Thread):
                     where += " 候选=" + "/".join(
                         f"{v}{'' if strong else '~'}({s:.2f},{n or '无档'})"
                         for v, s, strong, n in st["cands"][:4])
+                where += (" 锁定=" + (f"{st.get('speed'):g}" if st.get("speed_locked")
+                                      else "未"))
             ocr = st.get("ocr") or {}
             if ocr.get("box"):
                 where += f" 数字框{ocr['box']}"
             self._log(f"取帧 {t_read*1000:.0f}ms（请求 {tq*1000:.0f} / 解码 {td*1000:.0f}）"
                       f" | 识别 {t_rec*1000:.0f}ms | 风速 {st.get('speed')} "
                       f"θ={st.get('theta') and round(st['theta'], 1)} | {where}")
+        if st.get("lock_event"):                  # 锁定/解锁只在状态切换时各写一行
+            self._log(f"风速锁定：{st['lock_event']}")
         rej = (st.get("ocr") or {}).get("reject")
         if rej:                                   # 读成 35 m/s 这种不可能的 → 存帧留证并记日志
             self._log(f"读数越界已丢弃：读成 {rej['value']} m/s"
                       f"（置信 {rej['conf']:.2f}，框 {rej['box']}）")
             self._dump(rgb, st)
-        elif st.get("dial") is not None:
+        elif st.get("dial") is not None and not st.get("ok"):
             # 定位到了风盘却读不出风速 —— 这才值得存帧。没定位到（没在瞄准界面）不存，
             # 否则 3 个名额会被一堆废帧占满。
+            # ↑ 1.1.22：这里原先把 not st.get("ok") 漏了，于是"开跑前 6 个定位到风盘的帧"
+            #   就把名额全占满（哪怕那几帧识别得好好的），真出问题时反而没图可看。
             self._dump(rgb, st)
         if st.get("ok"):
             self.have_good, self.last_ok, self.bad = True, time.time(), 0
@@ -808,7 +815,10 @@ class Overlay:
                 # 反而连方向都看不清；详情走日志/终端。
                 sp_txt, col = "? m/s", DIM
             else:
-                sp_txt, col = f"{sp:g}{'?' if note else ''} m/s", speed_color(sp)
+                sp_txt = f"{sp:g}{'?' if note else ''} m/s"
+                if st.get("speed_locked"):
+                    sp_txt += " 锁"        # 这一洞的风速已锁定：不会再跟着单帧数字误读跳
+                col = speed_color(sp)
             self.l_wind.config(text=f"{wind_arrow(w['theta_deg'])}  {sp_txt}",
                                fg=col, font=self.font)
             self.l_ang.config(text=f"{ang:+.1f}°", font=self.font)
