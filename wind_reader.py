@@ -1348,7 +1348,13 @@ def _pick_elongated(mask: np.ndarray, rr: float,
         solid = c.area / float(max(c.w * c.h, 1))
         if solid < min_solid:
             continue
-        score = elong * min(solid, 1.0) * math.log1p(c.area)
+        # 打分 = 面积 × 实心 × 细长（细长封顶 4）。
+        # 为什么细长要封顶、而且要乘面积：原先用 `elong * solid * log1p(area)`，实测在真帧上
+        # 会被**一根细条**（elong 33、只有 456px，像是盘沿高光/面板分隔线）压过**真正的箭头**
+        # （elong 8.4、2336px）—— 因为两者 log 面积差不多，而细长那项差了三倍。方向就这么飘到
+        # 180° 外去了。细长已经用 min_elong 当硬门槛筛过，再往大里给权重没意义；"盘里最大的一块
+        # 纯色就是箭头"这条前提才该主导，所以让**面积**直接进分母。
+        score = min(elong, 4.0) * min(solid, 1.0) * float(c.area)
         if score > best_score:
             best_score, best = score, c
     return None if best is None else np.asarray(best.pixels, dtype=float)
@@ -1375,7 +1381,13 @@ def measure_arrow_generic(rgb: np.ndarray, dial: Dial, k: float | None = None,
     inside = ((xx - cxs) ** 2 + (yy - cys) ** 2) <= rr * rr
     on_disc = _disc_ellipse(dial, hb.shape[:2], ss=ss, box=box)
     grassish = ((hb[..., 0] >= 70.0) & (hb[..., 0] <= 115.0) & (hb[..., 1] >= 0.45))
-    generic = inside & on_disc & (hb[..., 1] >= 0.30) & (hb[..., 2] >= 0.45) & ~grassish
+    # 饱和门槛 0.60（不是 0.30）：原来 0.30 会把**天空**一起圈进来 —— 半透明面板后面的天空
+    # 色相 ~201、S 中位 0.40~0.45，和箭头连成一大坨，`_pick_elongated` 判它不细长就整条放弃。
+    # 实测箭头 S 中位 = 1.00（100% 的箭头像素 S>0.6），天空只有 2~12% 超过 0.6，门槛提到 0.6
+    # 正好分开。唯一例外是 11-15 那档品红箭头（游戏画得偏粉，S 只有 ~0.51），单独留条口子。
+    strong = ((hb[..., 1] >= 0.60)
+              | ((hb[..., 0] >= 300.0) & (hb[..., 0] <= 345.0) & (hb[..., 1] >= 0.40)))
+    generic = inside & on_disc & strong & (hb[..., 2] >= 0.45) & ~grassish
     P = _pick_elongated(generic, rr, min_elong=2.0, min_solid=0.35)
     if P is None or len(P) < 60 * ss * ss:
         return None
@@ -1983,6 +1995,7 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
     ss = max(1, int(supersample or SUPERSAMPLE))
     weak = False                                 # 数字只是"勉强过线"（best_effort）读出来的
     band_hint = None                             # 箭头自己的颜色档（读数字用，也是区间显示的来源）
+    band_strict = False                          # 严格档（不放宽）认出了箭头颜色 —— "盘里真有箭头"的判据
     boxes: list | None = None                    # 文字行候选框（一帧只搜一次，多轮复用）
     if speed is None and do_ocr:
         boxes = _find_text_lines(rgb, dial)          # 一帧只搜一次文字行候选，下面几轮复用
@@ -1990,6 +2003,7 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
         #    箭头是盘里最大的一块纯色，比细笔画数字可靠；这样"6 读成 5"这种
         #    跨档误读从源头上就不会发生（5 直接不在候选里）。
         band_hint = detect_arrow_band(rgb, dial)
+        band_strict = band_hint is not None
         if band_hint is None:                       # 颜色被采集卡洗淡时，放宽 S/V 再认一次
             band_hint = detect_arrow_band(rgb, dial, min_px=60, relax=0.30)
         if band_hint is not None:
@@ -2034,18 +2048,26 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
                 if r2.get("value") is not None:     # 没严格过关的会带 "~" 标记出现在候选表里
                     fr.cands.append([int(r2["value"]), float(r2.get("conf") or 0.0),
                                      bool(strong2), name2])
-    if speed is None and band_hint is None:
-        fr.message = "风速未识别（等待下一次读取）"
-        return fr
     fr.speed = None if speed is None else float(speed)
     fr.speed_note = "?" if weak else ""
+    pre_arrow = None                      # 0 m/s 那一步如果确认"其实有风"，直接把量到的箭头带下来
     if fr.speed is not None and abs(fr.speed) < 1e-9:
-        fr.ok, fr.no_wind, fr.speed = True, True, 0.0
-        fr.message = "风速 0 m/s —— 无风，按规则跳过计算"
-        return fr
+        # 读到 0 ≠ 真的无风：**无风时游戏不画箭头**，所以"盘里有没有箭头"才是判据。
+        # 0 和 8 是全库最像的一对（IoU 0.659），把 8 认成 0 完全可能，而一旦按"无风"短路，
+        # 方向也跟着丢了（"本来能识别的项被另一项拖死"）。
+        # 判据用**严格档**（不放宽）：
+        #   · 真无风帧实测：严格档 = None（干净），而"放宽档"会给个青档假阳性、
+        #     连不看色相的通用掩膜都会在空盘上找到 1290px 的假箭头 —— 那两个都不能当判据。
+        #   · 有风帧：严格档能认出箭头颜色（三档都是 1~15），所以读到 0 必然是误读。
+        if not band_strict:
+            fr.ok, fr.no_wind, fr.speed = True, True, 0.0
+            fr.message = "风速 0 m/s —— 无风，按规则跳过计算"
+            return fr
+        # 有箭头 ⇒ 这个 0 是误读：按"风速未读出、方向照给"处理（band 沿用严格档那个颜色）
+        fr.speed = None
     # 数字读出来 → 用数字对应的颜色；数字没读出但箭头颜色认出来了 → 用箭头自己的颜色
     band = wind_color(fr.speed) if fr.speed is not None else band_hint
-    arrow = measure_arrow(rgb, hsv, dial, supersample=ss, band=band)
+    arrow = pre_arrow if pre_arrow is not None else measure_arrow(rgb, hsv, dial, supersample=ss, band=band)
     if arrow is None and band is not None:
         # 采集卡把颜色洗淡时（色相还在、S/V 不达标），先用放宽门槛的同一档色带再试一次，
         # 再谈"是不是另一种颜色"。实测这就是"风速读得出、箭头找不到"的主因。
@@ -2090,9 +2112,9 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
             break
     if arrow is None:
         # 最后一招：完全不看色相，在盘面里找"高饱和、非草绿、明显细长"的那块（见函数注释）。
-        # 放在最后是为了不动已验证的路径：紧色带/放宽色带能读的帧，行为与之前完全一致。
-        if band is not None:
-            arrow = measure_arrow_generic(rgb, dial, supersample=ss)
+        # **不管 band 有没有都要试**：1.1.30 之前这里写了 `if band is not None`，于是
+        # "数字和颜色都认不出"（band=None）的帧连方向也一起丢了 —— 而方向恰恰不依赖它们俩。
+        arrow = measure_arrow_generic(rgb, dial, supersample=ss)
     if arrow is None:
         if mismatch:
             fr.message = "箭头颜色与风速数字对不上（数字读错？）"
@@ -2106,12 +2128,17 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
     fr.ok, fr.arrow, fr.phi, fr.k, fr.theta = True, arrow, arrow.phi, k, theta
     fr.arrow_band = arrow_band
     if fr.speed is None:
-        # 数字读不出、但箭头颜色认出来了：风速**降级成区间**显示，方向照样给（分量算不了）。
-        # 这就是"数字置信度低/读不出"时窗口该有的样子：`11-15 m/s` + 风向箭头。
-        fr.speed_range = wind_range(band)
         fr.wind = wind_metrics(None, theta)
-        fr.message = (f"数字未读出：风速按 {band_name(band)}档 "
-                      f"{fr.speed_range[0]}-{fr.speed_range[1]} m/s 显示，方向照给")
+        if band is not None:
+            # 数字读不出、但箭头颜色认出来了：风速**降级成区间**显示，方向照样给（分量算不了）。
+            # 这就是"数字置信度低/读不出"时窗口该有的样子：`11-15 m/s` + 风向箭头。
+            fr.speed_range = wind_range(band)
+            fr.message = (f"数字未读出：风速按 {band_name(band)}档 "
+                          f"{fr.speed_range[0]}-{fr.speed_range[1]} m/s 显示，方向照给")
+        else:
+            # 连颜色都没认出来，但箭头还是被"不看色相"的掩膜找到了 —— 有方向就先把方向给出去，
+            # 风速显示成 `? m/s`（窗口本来就有这个分支，以前永远走不到）。
+            fr.message = "风速与箭头颜色都没读出：只给方向（风速显示 ? m/s）"
     else:
         fr.wind = wind_metrics(fr.speed, theta)
     return fr

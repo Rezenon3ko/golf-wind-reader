@@ -103,7 +103,7 @@ LOCK_BREAK_RUN = 6                 # 锁定期间"独立读数连续落在另一
 #   ② 第一名占前两名"置信度之和"的比例 < CHOICE_RATIO —— 两个值咬得很紧。
 CHOICE_CONF = 0.80                 # 平均置信度下限（正常帧 0.87~1.00，根本不会触发）
 CHOICE_RATIO = 0.65                # 第一名在"前两名总票"里的占比下限
-CHOICE_MAX = 4                     # 最多给几个备选（一排按钮放得下）
+CHOICE_MAX = 5                     # 最多给几个备选（一排按钮放得下；"数字读不出"那档正好 5 个）
 CHOICE_TIMEOUT_S = 20.0            # 玩家一直不点 → 按最高分自动锁，别一直挂着
 FLIP_CONF = 0.6                    # 方向置信度低于此值时才做反 180° 保护
 FLIP_RUN = 3                       # 连续这么多次"反向"才认为真的转向了
@@ -438,7 +438,9 @@ class Recognizer:
         self.lock_mismatch = ""                        # 锁定值与这一拍独立读数打架时的说明（每帧清空）
         self._choice: int | None = None                # 玩家点的备选风速（UI 线程写、识别线程读）
         self.choice_options: list | None = None        # 弹出备选时的按钮内容 [[值, 平均置信度, 拍数], ...]
+        self.choice_hint = ""                          # 弹窗标题里的那句（"风速拿不准" / "数字没读出"）
         self.ask_since: float | None = None            # 备选弹出来的时刻（超时自动锁用）
+        self.band_asked = False                        # "数字读不出"那组备选已经问过且被晾着 → 别再弹
         self.ocr = W.OcrState()          # 字形模板库状态独立
         n = W.load_glyph_bank(GLYPH_BANK, state=self.ocr)
         if not n:
@@ -509,6 +511,7 @@ class Recognizer:
                         self.choice_options = [[int(k), round(c[1] / max(c[0], 1), 2), int(c[0])]
                                                for k, c in ranked[:CHOICE_MAX]]
                         self.ask_since = now
+                        self.choice_hint = "风速拿不准"
                     if now - (self.ask_since or now) < CHOICE_TIMEOUT_S:
                         return
                     # 一直没人点 → 按最高分自动锁（并在日志里说清是超时自动定的）
@@ -523,6 +526,19 @@ class Recognizer:
                     self.lock_event = (f"风速锁定 {v} m/s（前 {WIND_MEASURE_S:g}s 里 "
                                        f"{n} 拍读到它、置信度和 {s:.2f} 最高"
                                        + (f"；其它 {losers}" if losers else "") + "）")
+            elif fr.speed_range and now - (self.measure_t0 or now) >= WIND_MEASURE_S:
+                # 数字**一直读不出**、但箭头颜色认得出（风速只给了个区间）——以前这条路锁永远锁不上，
+                # 区间会一直挂着。现在把这一档的数字全列出来让玩家点一个（6-10 就列 6 7 8 9 10）。
+                if self.choice_options is None and not self.band_asked:
+                    lo, hi = fr.speed_range
+                    self.choice_options = [[v, 0.0, 0] for v in range(lo, hi + 1)][:CHOICE_MAX]
+                    self.ask_since = now
+                    self.choice_hint = f"数字没读出（{W.band_name(fr.arrow_band)}档）"
+                if self.choice_options is not None:
+                    if now - (self.ask_since or now) < CHOICE_TIMEOUT_S:
+                        return
+                    self.band_asked = True            # 超时=玩家不答，别再反复弹同一组
+                    self._clear_choice()
             return
         # ---- 已锁定：这一拍的独立读数只当安全网 ----
         band_lock = W.wind_color(self.locked)
@@ -571,6 +587,7 @@ class Recognizer:
     def _clear_choice(self) -> None:
         self._choice = None
         self.choice_options = None
+        self.choice_hint = ""
         self.ask_since = None
 
     def _unlock(self) -> None:
@@ -580,6 +597,7 @@ class Recognizer:
         self.measure_t0 = None
         self.break_run = 0
         self.lock_mismatch = ""
+        self.band_asked = False
         self._clear_choice()
 
     def _wind_gone(self) -> None:
@@ -641,7 +659,9 @@ class Recognizer:
             self._wind_gone()
         if fr.ocr is not None and fr.ocr.get("value") is None and self.args.verbose:
             print("\n[风读] 未读出风速（等待下一次读取）")
-        if fr.speed is None and not fr.speed_range:
+        # 只有"风速、区间、方向**全都没有**"才算整帧失败 —— 只要箭头找到了（哪怕是"不看色相"
+        # 的通用掩膜量出来的），方向就该照给，风速显示 ? m/s 也比整条丢掉强。
+        if fr.speed is None and not fr.speed_range and fr.arrow is None:
             return {"ok": False, "message": "风速未识别（等待下一次读取）",
                     "dial": d, "ocr": fr.ocr,
                     "speed_locked": self.locked is not None, "lock_event": self.lock_event}
@@ -691,6 +711,7 @@ class Recognizer:
                 "arrow_band": fr.arrow_band,
                 "need_choice": bool(self.choice_options) and self.locked is None,
                 "choice_options": self.choice_options or [],
+                "choice_hint": self.choice_hint,
                 "latency_ms": (time.time() - t0) * 1000.0}
 
     # ---- 抖动抑制：静止时取平均并定住 ----

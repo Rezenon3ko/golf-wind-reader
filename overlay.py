@@ -845,7 +845,11 @@ class Overlay:
             self._line1(st["text"], ERR if kind == "error" else DIM)
             return
 
-        self._choice_popup(st.get("choice_options") if st.get("need_choice") else None)
+        # 需要玩家选风速时弹备选；其它情况一律收起。
+        # （注意这行必须在上面那个 return **之外**：之前插在 error/status 分支里，正常帧
+        #   根本走不到，弹窗等于永远不出现。）
+        self._choice_popup(st.get("choice_options") if st.get("need_choice") else None,
+                           st.get("choice_hint") or "")
         if st.get("no_wind"):
             self.ok = True
             self._line1("·  0 m/s（无风）", DIM)
@@ -899,7 +903,7 @@ class Overlay:
             self._calc()
 
     # ---- 锁定前"拿不准就问玩家"：备选风速的小弹窗 ----
-    def _choice_popup(self, options) -> None:
+    def _choice_popup(self, options, hint: str = "") -> None:
         """
         显示 / 更新 / 收起"选风速"的弹窗；options=None 表示收起。
 
@@ -908,20 +912,22 @@ class Overlay:
         搞坏（尺寸一抖动，缩放和贴边就跟着歪）。弹窗平时不存在，只有需要玩家决策时才冒出来。
         """
         opts = options or []
-        key = tuple((int(v), round(float(c), 2)) for v, c, _n in opts)
-        if not key:
-            if self.pick is not None:
+        if not opts:                                  # 空备选 = 收起（注意不能用 key 判空：
+            if self.pick is not None:                 #   key 里带了 hint，("拿不准",) 也是真值）
                 self.pick.withdraw()
             self._pick_key = None
             return
+        key = tuple((int(v), round(float(c), 2)) for v, c, _n in opts) + (hint,)
         if self.pick is None:
             self._build_pick()
-        if key != self._pick_key:                     # 备选变了 → 重建按钮（同一个备选就不闪）
+        if key != self._pick_key:
+            # 备选或标题变了 → 重建按钮（同一组备选就不重建，免得按钮在手指底下闪）
+            self._pick_title.config(text=f"{hint or '风速拿不准'}，点一个：")
             for w in self._pick_btns:
                 w.destroy()
             self._pick_btns = []
             for v, conf, n in opts:
-                b = tk.Button(self._pick_row, text=str(int(v)), width=2,
+                b = tk.Button(self._pick_row, text=str(int(v)), width=max(2, len(str(int(v)))),
                               font=self._font_at(PICK_SIZE), bg=ENT_BG, fg=FG,
                               activebackground=ACCENT, activeforeground=BG,
                               relief="flat", bd=0, highlightthickness=0,
@@ -948,8 +954,9 @@ class Overlay:
             p.attributes("-alpha", max(0.88, min(1.0, float(self._alpha) + 0.34)))
         except Exception:
             pass
-        tk.Label(p, text="风速拿不准，点一个：", font=self._font_at(PICK_SIZE),
-                 bg=BG, fg=WARN).pack(padx=PICK_PAD, pady=(PICK_PAD, 4))
+        self._pick_title = tk.Label(p, text="风速拿不准，点一个：", font=self._font_at(PICK_SIZE),
+                                    bg=BG, fg=WARN)
+        self._pick_title.pack(padx=PICK_PAD, pady=(PICK_PAD, 4))
         self._pick_row = tk.Frame(p, bg=BG)
         self._pick_row.pack(padx=PICK_PAD, pady=(0, PICK_PAD))
         self._pick_btns: list = []
