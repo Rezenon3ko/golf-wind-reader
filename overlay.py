@@ -167,7 +167,8 @@ HOLD_SEC = 2.5        # …且距上次成功超过这么多秒，才把提示�
                       # 两个条件都要满足：单帧失败一律按住（慢机器一帧 2~3 秒，只看时间会一失败就弹提示）
 
 # ---- 占盘上限：日志 + 诊断图总共不超过 5MB ----
-LOG_ROLL = 1 * 1024 * 1024        # 日志写到 1MB 就滚动一次（保留上一轮 → 日志最多 2MB）
+LOG_ROLL = 512 * 1024             # 日志写到 512KB 就滚动一次（保留上一轮 → 日志最多 1MB）
+LOG_LINE_MAX = 320                # 单行兜底：再长也截断（正常行 ~240 字符，基本截不到）
 DUMP_BUDGET = 2 * 1024 * 1024     # 所有诊断图加起来不超过 2MB（超了按时间删旧的）
 DUMP_MAX_W = 1280                 # 诊断图缩到最宽 1280：够看上下文，体积只有几十~几百 KB
 DUMP_Q = 80                       # 整帧存 JPEG（有损但够看）；数字框另存无损 PNG（那才是要抠字形的地方）
@@ -198,6 +199,21 @@ SAMPLES = (("→  15 m/s", "+179.9°", "→ 13.55", "↑ 13.55"),   # 正常结�
            ("→  11-15 m/s", "+179.9°", "", ""),               # 只认出颜色档：三段区间里最长的 11-15
            ("→  15 m/s " + LOCK_MARK, "+179.9°", "→ 13.55", "↑ 13.55"),  # 锁定：数字后面多个标记
            ("·  0 m/s（无风）", "", "", ""))                   # 无风提示
+
+
+def _num(v, fmt: str = "g", dash: str = "—") -> str:
+    """
+    把"可能是 None / 根本不存在"的数值安全地格式化成字符串。
+
+    为什么需要：日志行里混着各种来源的字段（风速、θ、置信度…），只要有一个是 None，
+    f"{v:g}" 就会抛 TypeError。而这条日志是在**识别线程**里拼的 —— 一抛异常整帧白干，
+    用户看到的就是"识别线程异常：unsupported format string passed to NoneType.__format__"。
+    日志只是旁路，绝不能反过来把识别搞崩，所以所有数值都走这里。
+    """
+    try:
+        return format(float(v), fmt)
+    except (TypeError, ValueError):
+        return dash
 
 
 # --------------------------------------------------------------------------
@@ -340,33 +356,44 @@ class Reader(threading.Thread):
         now = time.time()
         if now >= self.next_beat:                 # 每 10 秒记一条"体检"行：够定位慢在哪一段，又不刷屏
             self.next_beat = now + 10.0
-            tq, td = getattr(src, "last_timing", (0.0, 0.0))
-            d = st.get("dial")
-            where = f"风盘({d.cx:.0f},{d.cy:.0f}) r={d.r:.0f}" if d else "没定位到风盘"
-            if d is not None:
-                # k 是每帧实测的俯视压缩比；掩膜用的是"顶面"还是"剪影"决定读数有没有侧壁偏置
-                arrow = st.get("arrow")
-                where += f" k={d.k:.3f}"
-                if arrow is not None and getattr(arrow, "source", ""):
-                    where += f" 掩膜={arrow.source}({arrow.n_pixels}px)"
-                # 判定：带 "?" = 数字勉强过线；"(区间)" = 只认出颜色档
-                if st.get("speed_range"):
-                    sp_txt = f"{st['speed_range'][0]}-{st['speed_range'][1]}(区间)"
-                else:
-                    sp_txt = f"{st.get('speed')}{st.get('speed_note') or ''}"
-                where += f" 判定={sp_txt}"
-                if st.get("cands"):                  # 候选表：带 "~" 的是没严格过关的
-                    where += " 候选=" + "/".join(
-                        f"{v}{'' if strong else '~'}({s:.2f},{n or '无档'})"
-                        for v, s, strong, n in st["cands"][:4])
-                where += (" 锁定=" + (f"{st.get('speed'):g}" if st.get("speed_locked")
-                                      else "未"))
-            ocr = st.get("ocr") or {}
-            if ocr.get("box"):
-                where += f" 数字框{ocr['box']}"
-            self._log(f"取帧 {t_read*1000:.0f}ms（请求 {tq*1000:.0f} / 解码 {td*1000:.0f}）"
-                      f" | 识别 {t_rec*1000:.0f}ms | 风速 {st.get('speed')} "
-                      f"θ={st.get('theta') and round(st['theta'], 1)} | {where}")
+            # 整段拼装都包在 try 里：日志是旁路，任何字段缺失/类型不对都不许把识别线程搞崩
+            # （1.1.27 之前这里 f"{st.get('speed'):g}" 在"锁着但这一拍没读出风速"的帧上会抛
+            #   TypeError: unsupported format string passed to NoneType.__format__，整帧白干）。
+            try:
+                tq, td = getattr(src, "last_timing", (0.0, 0.0))
+                d = st.get("dial")
+                where = f"风盘({d.cx:.0f},{d.cy:.0f}) r={d.r:.0f}" if d else "没定位到风盘"
+                if d is not None:
+                    # k 是每帧实测的俯视压缩比；掩膜取哪张决定读数有没有侧壁偏置
+                    arrow = st.get("arrow")
+                    where += f" k={_num(d.k, '.3f')}"
+                    if arrow is not None and getattr(arrow, "source", ""):
+                        where += f" 掩膜={arrow.source}({arrow.n_pixels}px)"
+                    # 判定：带 "?" = 数字勉强过线；"(区间)" = 只认出颜色档
+                    sp_val, rng = st.get("speed"), st.get("speed_range")
+                    if rng:
+                        sp_txt = f"{rng[0]}-{rng[1]}(区间)"
+                    elif sp_val is None:
+                        sp_txt = "未读出"
+                    else:
+                        sp_txt = f"{_num(sp_val)}{st.get('speed_note') or ''}"
+                    where += f" 判定={sp_txt}"
+                    # 候选表：只在"不止一个候选"或"有没严格过关的"时才写 —— 单个强候选跟
+                    # 判定= 完全重复，写出来只是把每行撑长
+                    cands = st.get("cands") or []
+                    if len(cands) > 1 or any(not c[2] for c in cands):
+                        where += " 候选=" + "/".join(
+                            f"{v}{'' if strong else '~'}({_num(s, '.2f')},{n or '无档'})"
+                            for v, s, strong, n in cands[:4])
+                    where += " 锁定=" + (_num(sp_val) if st.get("speed_locked") else "未")
+                ocr = st.get("ocr") or {}
+                if ocr.get("box"):
+                    where += f" 数字框{ocr['box']}"
+                self._log(f"取帧 {t_read*1000:.0f}ms（请求 {tq*1000:.0f} / 解码 {td*1000:.0f}）"
+                          f" | 识别 {t_rec*1000:.0f}ms | 风速 {_num(st.get('speed'))} "
+                          f"θ={_num(st.get('theta'), '.1f')} | {where}")
+            except Exception as exc:              # 兜底：日志行拼不出来也不能影响识别
+                self._log(f"体检行拼装失败：{exc!r}")
         if st.get("lock_event"):                  # 锁定/解锁只在状态切换时各写一行
             self._log(f"风速锁定：{st['lock_event']}")
         rej = (st.get("ocr") or {}).get("reject")
@@ -434,12 +461,21 @@ class Reader(threading.Thread):
 
         位置在程序所在文件夹（exe / .app 旁边）；写不进去才退回用户主目录。
         内容：启动、连接、报错、越界读数，外加每 10 秒一条耗时"体检"行。
-        写到 1MB 就滚动一次、只留上一轮（.log.1），所以日志最多 2MB。
+        写到 LOG_ROLL 就滚动一次、只留上一轮（.log.1），所以日志最多 2×LOG_ROLL。
         """
         try:
             path = os.path.join(_artifact_dir(), "nssr-overlay.log")
+            if len(line) > LOG_LINE_MAX:              # 单行兜底：任何字段异常都不该写出一条巨行
+                line = line[:LOG_LINE_MAX] + f"…（原 {len(line)} 字符）"
             if os.path.exists(path) and os.path.getsize(path) > LOG_ROLL:
-                os.replace(path, path + ".1")      # 只留上一轮：日志总共最多 2×LOG_ROLL
+                try:
+                    os.replace(path, path + ".1")    # 只留上一轮：日志总共最多 2×LOG_ROLL
+                except OSError:
+                    # Windows 上日志被记事本之类的程序打开着时 os.replace 会失败 ——
+                    # 以前这里直接吞掉异常，结果**日志从那以后就再也不滚动了**（无限长大）。
+                    # 退一步：原地清空。宁可丢掉旧内容，也不能让日志无上限地涨。
+                    with open(path, "w", encoding="utf-8"):
+                        pass
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(f"{time.strftime('%H:%M:%S')}  {line}\n")
         except Exception:

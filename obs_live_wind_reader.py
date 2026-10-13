@@ -704,6 +704,14 @@ class Recognizer:
 # 三、输出
 # ==========================================================================
 
+def _num(v, fmt: str = "g", dash: str = "—") -> str:
+    """安全格式化"可能是 None"的数值。终端/日志是旁路，不该因为一个字段缺失就抛异常。"""
+    try:
+        return format(float(v), fmt)
+    except (TypeError, ValueError):
+        return dash
+
+
 def line_for(st: dict) -> str:
     if st.get("no_wind"):
         return "风速 0 m/s —— 无风，跳过计算（等风速变化）"
@@ -716,7 +724,9 @@ def line_for(st: dict) -> str:
     if st.get("speed") is None and rng:
         return (f"风速 {rng[0]}-{rng[1]} m/s（数字未读出，按箭头颜色档显示）| "
                 f"夹角 {w['theta_deg']:.1f}° | 横向/纵向算不了")
-    return (f"风 {w['speed']:g} m/s | 夹角 {w['theta_deg']:.1f}° | "
+    if "lateral_abs" not in w:                     # 风速没定就没有分量，别在这里 KeyError
+        return f"夹角 {w['theta_deg']:.1f}° | 横向/纵向算不了（风速未定）"
+    return (f"风 {_num(w.get('speed'))} m/s | 夹角 {w['theta_deg']:.1f}° | "
             f"横向 {w['lateral_abs']:.2f} {w['lateral_dir']} | "
             f"纵向 {w['longitudinal_abs']:.2f} {w['longitudinal_dir']}")
 
@@ -745,8 +755,10 @@ def print_test_report(st: dict, rgb) -> None:
         if sp is None and rng:
             # 只认出颜色档：风速降级成区间（方向照给，分量算不了）
             print(f"风速        : {rng[0]}-{rng[1]} m/s（数字未读出，按箭头颜色档显示）")
+        elif sp is None:
+            print("风速        : 未读出（方向照给）")
         else:
-            print(f"风速        : {sp:g}{'?' if note else ''} m/s")
+            print(f"风速        : {_num(sp)}{'?' if note else ''} m/s")
         if st.get("cands"):
             print("数字候选    : " + "  ".join(
                 f"{v}{'' if strong else '~'}({s:.2f},{n or '无档'})"
