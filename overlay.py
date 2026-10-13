@@ -139,6 +139,10 @@ FG = "#f2f4f7"
 DIM = "#8b93a1"
 ERR = "#ff6b6b"
 ENT_BG = "#0e1014"     # 系数输入框的底：比窗口底色再深一点，看着像个"槽"
+WARN = "#ffd166"       # 提示色（"风速拿不准，点一个"）
+ACCENT = "#7fd1ff"     # 按钮按下去的底色
+PICK_SIZE = 16         # 备选风速弹窗里面的字号（比主行小一号，别喧宾夺主）
+PICK_PAD = 8
 PAD = 0                        # 左右留白；0 = 窗口宽度就是第一行的宽度（第二行字小，顶不出窗口）
 # 风向箭头：按真实夹角 θ（0=正前，顺时针）取 8 向
 ARROWS8 = "↑↗→↘↓↙←↖"
@@ -223,6 +227,7 @@ class Reader(threading.Thread):
     def __init__(self, out: queue.Queue, stop: threading.Event):
         super().__init__(daemon=True)
         self.out, self.stop = out, stop
+        self.rec = None              # 建好之后挂在这里：悬浮窗上的"选风速"按钮要往里递玩家点的数
         self._last_msg, self._last_msg_t = "", 0.0   # 同样的报错 10 秒内只报一次，别刷屏
         self.have_good = False       # 是否出过至少一次好结果
         self.last_ok = 0.0           # 上一次识别成功的时间
@@ -241,6 +246,7 @@ class Reader(threading.Thread):
                 if rec is None:                   # 识别器只建一次：它跟 OBS 无关，
                     try:                          # 先建它，出问题就不会留下一截连上的 OBS 会话
                         rec = O.Recognizer(SimpleNamespace(verbose=False))
+                        self.rec = rec            # ← 给 UI 线程用（见 Overlay._choose）
                     except Exception as exc:      # 本地环境问题（多半是字形库/依赖），照实说
                         self._report(f"初始化失败：{exc}")
                         self.stop.wait(backoff)
@@ -659,7 +665,12 @@ class Overlay:
             w.bind("<Button-5>", self._wheel)         # Linux 下滚
 
         self._place()
-        Reader(self.q, self.stop).start()
+        # 备选风速的弹窗（"锁定前拿不准就问玩家"用）。懒建：不用的时候一个窗口都不多。
+        self.pick: tk.Toplevel | None = None
+        self._pick_key: tuple | None = None       # 当前弹窗显示的是哪一组备选（变了就重建）
+        self._alpha = args.alpha
+        self.reader = Reader(self.q, self.stop)
+        self.reader.start()
         self.root.after(80, self._poll)
 
     # ---- 窗口位置 ----
@@ -830,9 +841,11 @@ class Overlay:
         kind = st.get("kind")
         if kind in ("error", "status"):             # 异常/状态直接顶到第一行
             self.ok = False
+            self._choice_popup(None)                # 报错/状态时把备选弹窗收掉（别挂着误导人）
             self._line1(st["text"], ERR if kind == "error" else DIM)
             return
 
+        self._choice_popup(st.get("choice_options") if st.get("need_choice") else None)
         if st.get("no_wind"):
             self.ok = True
             self._line1("·  0 m/s（无风）", DIM)
@@ -884,6 +897,87 @@ class Overlay:
                 self.l_lon.config(text="", fg=DIM, font=self.font)
                 self.lat_now = None
             self._calc()
+
+    # ---- 锁定前"拿不准就问玩家"：备选风速的小弹窗 ----
+    def _choice_popup(self, options) -> None:
+        """
+        显示 / 更新 / 收起"选风速"的弹窗；options=None 表示收起。
+
+        为什么单独开一个 Toplevel，而不是往主窗口里加一行：主窗口的尺寸是按"最长一行"定死的，
+        还带左下角把手拖拽缩放和滚轮缩放，往里塞一行动态内容很容易把那些**已经验证过的**行为
+        搞坏（尺寸一抖动，缩放和贴边就跟着歪）。弹窗平时不存在，只有需要玩家决策时才冒出来。
+        """
+        opts = options or []
+        key = tuple((int(v), round(float(c), 2)) for v, c, _n in opts)
+        if not key:
+            if self.pick is not None:
+                self.pick.withdraw()
+            self._pick_key = None
+            return
+        if self.pick is None:
+            self._build_pick()
+        if key != self._pick_key:                     # 备选变了 → 重建按钮（同一个备选就不闪）
+            for w in self._pick_btns:
+                w.destroy()
+            self._pick_btns = []
+            for v, conf, n in opts:
+                b = tk.Button(self._pick_row, text=str(int(v)), width=2,
+                              font=self._font_at(PICK_SIZE), bg=ENT_BG, fg=FG,
+                              activebackground=ACCENT, activeforeground=BG,
+                              relief="flat", bd=0, highlightthickness=0,
+                              cursor="hand2",
+                              command=lambda v=v: self._choose(v))
+                b.pack(side="left", padx=(0, 6))
+                self._pick_btns.append(b)
+            self._pick_key = key
+        # 弹窗里的分数只写日志（按钮上只放数字，玩家该按游戏画面来选，不是按我们的分数）
+        self.pick.deiconify()
+        self.pick.lift()
+        try:
+            self.pick.attributes("-topmost", True)
+        except Exception:
+            pass
+        self._place_pick()
+
+    def _build_pick(self) -> None:
+        p = tk.Toplevel(self.root)
+        p.overrideredirect(True)                      # 无边框，跟主窗口一个风格
+        p.configure(bg=BG)
+        try:
+            p.attributes("-topmost", True)
+            p.attributes("-alpha", max(0.88, min(1.0, float(self._alpha) + 0.34)))
+        except Exception:
+            pass
+        tk.Label(p, text="风速拿不准，点一个：", font=self._font_at(PICK_SIZE),
+                 bg=BG, fg=WARN).pack(padx=PICK_PAD, pady=(PICK_PAD, 4))
+        self._pick_row = tk.Frame(p, bg=BG)
+        self._pick_row.pack(padx=PICK_PAD, pady=(0, PICK_PAD))
+        self._pick_btns: list = []
+        self.pick = p
+        p.withdraw()
+
+    def _place_pick(self) -> None:
+        """贴在主窗口正下方；下面放不下就摆到主窗口上方（始终整窗可见）。"""
+        self.pick.update_idletasks()
+        w, h = self.pick.winfo_reqwidth(), self.pick.winfo_reqheight()
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        x = self.root.winfo_x()
+        y = self.root.winfo_y() + self.cur_h + 4
+        if y + h > sh - 8:
+            y = max(0, self.root.winfo_y() - h - 4)
+        x = max(0, min(x, sw - w - 8))
+        self.pick.geometry(f"{w}x{h}+{int(x)}+{int(y)}")
+
+    def _choose(self, value) -> None:
+        """玩家点了某个备选风速 → 递给识别线程，并立刻收起弹窗（手感上"点了就生效"）。"""
+        rec = getattr(self.reader, "rec", None)
+        if rec is not None:
+            try:
+                rec.choose(value)
+                Reader._log(f"玩家选了风速 {int(value)} m/s")   # 日志是 Reader 的静态方法
+            except Exception as exc:
+                Reader._log(f"备选风速递交失败：{exc!r}")
+        self._choice_popup(None)
 
     def _line1(self, text: str, color: str) -> None:
         """

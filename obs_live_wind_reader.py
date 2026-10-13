@@ -96,6 +96,15 @@ WIND_MEASURE_S = 5.0               # 看到风向盘后先正常测这么久，�
 #   值得留 —— 真正该解决"瞄得快"的办法是"某一拍置信度特别高就立刻锁"，而不是缩小窗口。）
 WIND_UNLOCK_S = 30.0               # 风向盘消失超过这么久（时限，暂定）→ 判定进入下一洞 → 解锁重新测
 LOCK_BREAK_RUN = 6                 # 锁定期间"独立读数连续落在另一档"这么多拍 → 认为换洞了（安全网）
+# ---- 锁定前"拿不准就问人" ----
+# 5 秒测完，如果读数不够一边倒，就先别锁，把前几名当**备选**弹出来让玩家点一个。
+# 判据两条（满足任一条就问）：
+#   ① 第一名的平均置信度 < CHOICE_CONF          —— 谁都不像；
+#   ② 第一名占前两名"置信度之和"的比例 < CHOICE_RATIO —— 两个值咬得很紧。
+CHOICE_CONF = 0.80                 # 平均置信度下限（正常帧 0.87~1.00，根本不会触发）
+CHOICE_RATIO = 0.65                # 第一名在"前两名总票"里的占比下限
+CHOICE_MAX = 4                     # 最多给几个备选（一排按钮放得下）
+CHOICE_TIMEOUT_S = 20.0            # 玩家一直不点 → 按最高分自动锁，别一直挂着
 FLIP_CONF = 0.6                    # 方向置信度低于此值时才做反 180° 保护
 FLIP_RUN = 3                       # 连续这么多次"反向"才认为真的转向了
 SMOOTH_A = 0.25                    # 角度指数平滑系数：越小越稳、越大越跟手
@@ -427,6 +436,9 @@ class Recognizer:
         self.break_run = 0                             # 独立读数落在"另一档"的连续拍数（安全网）
         self.lock_event = ""                           # 状态切换时留一句话，交给日志（每帧清空）
         self.lock_mismatch = ""                        # 锁定值与这一拍独立读数打架时的说明（每帧清空）
+        self._choice: int | None = None                # 玩家点的备选风速（UI 线程写、识别线程读）
+        self.choice_options: list | None = None        # 弹出备选时的按钮内容 [[值, 平均置信度, 拍数], ...]
+        self.ask_since: float | None = None            # 备选弹出来的时刻（超时自动锁用）
         self.ocr = W.OcrState()          # 字形模板库状态独立
         n = W.load_glyph_bank(GLYPH_BANK, state=self.ocr)
         if not n:
@@ -483,15 +495,34 @@ class Recognizer:
                 slot = self.votes.setdefault(int(round(fr.speed)), [0, 0.0])
                 slot[0] += 1
                 slot[1] += conf
+            if self._choice is not None:              # 玩家在悬浮窗上点了一个 → 直接照它锁
+                self.locked, self.break_run = float(self._choice), 0
+                self.lock_event = f"风速按玩家的选择锁定 {self.locked:g} m/s"
+                self._clear_choice()
+                return
             if self.votes and now - self.measure_t0 >= WIND_MEASURE_S:
-                v, (n, s) = max(self.votes.items(), key=lambda kv: (kv[1][1], kv[1][0]))
+                ranked = sorted(self.votes.items(), key=lambda kv: (-kv[1][1], -kv[1][0]))
+                v, (n, s) = ranked[0]
+                if self._too_close_to_call(ranked):
+                    # 拿不准 → 先把备选弹给玩家，等他点；期间继续收票（也继续显示）
+                    if self.choice_options is None:
+                        self.choice_options = [[int(k), round(c[1] / max(c[0], 1), 2), int(c[0])]
+                                               for k, c in ranked[:CHOICE_MAX]]
+                        self.ask_since = now
+                    if now - (self.ask_since or now) < CHOICE_TIMEOUT_S:
+                        return
+                    # 一直没人点 → 按最高分自动锁（并在日志里说清是超时自动定的）
+                    self.lock_event = (f"等玩家选风速超时（{CHOICE_TIMEOUT_S:g}s）→ "
+                                       f"按最高分自动锁定 {v} m/s")
                 self.locked, self.break_run = float(v), 0
+                self._clear_choice()
                 losers = "、".join(f"{k}({c[0]}拍/Σ{c[1]:.2f})"
                                    for k, c in sorted(self.votes.items(),
                                                       key=lambda kv: -kv[1][1]) if k != v)
-                self.lock_event = (f"风速锁定 {v} m/s（前 {WIND_MEASURE_S:g}s 里 "
-                                   f"{n} 拍读到它、置信度和 {s:.2f} 最高"
-                                   + (f"；其它 {losers}" if losers else "") + "）")
+                if not self.lock_event:
+                    self.lock_event = (f"风速锁定 {v} m/s（前 {WIND_MEASURE_S:g}s 里 "
+                                       f"{n} 拍读到它、置信度和 {s:.2f} 最高"
+                                       + (f"；其它 {losers}" if losers else "") + "）")
             return
         # ---- 已锁定：这一拍的独立读数只当安全网 ----
         band_lock = W.wind_color(self.locked)
@@ -513,6 +544,35 @@ class Recognizer:
         else:
             self.break_run = 0                        # 同档、或这拍没读出来 → 清零
 
+    @staticmethod
+    def _too_close_to_call(ranked: list) -> bool:
+        """
+        读数够不够一边倒？不够就让玩家来定（见 CHOICE_CONF / CHOICE_RATIO 的注释）。
+        ranked 是 [(值, [拍数, 置信度之和]), ...]，已按置信度之和降序。
+        """
+        if len(ranked) < 2:
+            return False                              # 只有一个候选，没得选
+        (top_v, (top_n, top_sum)) = ranked[0]
+        second_sum = ranked[1][1][1]
+        top_avg = top_sum / max(top_n, 1)
+        if top_avg < CHOICE_CONF:
+            return True
+        return top_sum / max(top_sum + second_sum, 1e-9) < CHOICE_RATIO
+
+    def choose(self, value) -> None:
+        """
+        玩家在悬浮窗上点了一个备选风速（**UI 线程**调用）。
+
+        只写一个属性：读它的识别线程下一拍就会用上。整型/None 的赋值在 CPython 里是原子的，
+        这里不需要锁（也刻意不引入锁 —— 识别线程一拍几百毫秒，锁在这个场景只会添乱）。
+        """
+        self._choice = int(round(float(value)))
+
+    def _clear_choice(self) -> None:
+        self._choice = None
+        self.choice_options = None
+        self.ask_since = None
+
     def _unlock(self) -> None:
         """解锁：回到"重新测量"状态，等风向盘下次出现再锁一次。"""
         self.locked = None
@@ -520,6 +580,7 @@ class Recognizer:
         self.measure_t0 = None
         self.break_run = 0
         self.lock_mismatch = ""
+        self._clear_choice()
 
     def _wind_gone(self) -> None:
         """
@@ -607,6 +668,11 @@ class Recognizer:
             # 锁上了：风速用锁定值（数字这一拍读成什么、读没读出来都不影响显示），
             # 方向照常每帧实测 —— θ 是"相对瞄准方向"的夹角，本来就会跟着转身变化。
             fr.speed, fr.speed_note, fr.speed_range = self.locked, "", None
+        elif self.choice_options:
+            # 拿不准、正等玩家从备选里点一个：显示先钉在**第一候选**上（带 "?"），
+            # 不显示这一拍的原始读数 —— 否则玩家看按钮的同时数字还在乱跳。
+            fr.speed = float(self.choice_options[0][0])
+            fr.speed_note, fr.speed_range = "?", None
 
         # 反 180° 保护 → 静止取平均（抖动抑制）
         theta = self._flip_guard(fr.theta, fr.arrow.conf if fr.arrow else 1.0)
@@ -623,6 +689,8 @@ class Recognizer:
                 "speed_locked": self.locked is not None, "lock_event": self.lock_event,
                 "lock_mismatch": self.lock_mismatch,
                 "arrow_band": fr.arrow_band,
+                "need_choice": bool(self.choice_options) and self.locked is None,
+                "choice_options": self.choice_options or [],
                 "latency_ms": (time.time() - t0) * 1000.0}
 
     # ---- 抖动抑制：静止时取平均并定住 ----
