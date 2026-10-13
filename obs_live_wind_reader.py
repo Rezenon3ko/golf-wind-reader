@@ -456,9 +456,11 @@ class Recognizer:
 
         # 每帧都重新读风速（模板匹配只要 ~4ms，读准了才知道箭头该是什么颜色）
         fr = W.read_wind(rgb, d, ocr_state=self.ocr)
-        if fr.ok and fr.speed is not None:
+        # fr.ok 且找到箭头就算"这一帧读到了"：只认出颜色档、数字没读出的帧方向照样显示，
+        # 不该因为"数字读不出"就去反复重新定位（重定位会清掉角度平滑，显示反而更抖）。
+        if fr.ok:
             self.bad = 0
-            if self.side is None:                 # 真读出结果了才锁侧别，之后只搜这一侧
+            if self.side is None and fr.speed is not None:   # 真读出风速了才锁侧别
                 self.side = "右" if d.cx >= w / 2.0 else "左"
         else:
             self.bad += 1
@@ -469,7 +471,7 @@ class Recognizer:
                     print("\n[定位] 连续读不出来 → 丢弃缓存，重新定位")
         if fr.ocr is not None and fr.ocr.get("value") is None and self.args.verbose:
             print("\n[风读] 未读出风速（等待下一次读取）")
-        if fr.speed is None:
+        if fr.speed is None and not fr.speed_range:
             return {"ok": False, "message": "风速未识别（等待下一次读取）",
                     "dial": d, "ocr": fr.ocr}
         if fr.no_wind:
@@ -487,6 +489,10 @@ class Recognizer:
         self._hold_dir(wind)
         return {"ok": True, "speed": fr.speed, "phi": fr.phi, "k": fr.k, "theta": theta,
                 "wind": wind, "dial": d, "arrow": fr.arrow,
+                # 低置信度的显示语义：speed_note="?" 表示数字只是勉强过线（显示成 "7? m/s"）；
+                # speed_range 表示只认出颜色档（显示成 "6-10 m/s"，分量算不了）；cands 供日志排查
+                "speed_note": fr.speed_note, "speed_range": fr.speed_range,
+                "cands": fr.cands,
                 "latency_ms": (time.time() - t0) * 1000.0}
 
     # ---- 抖动抑制：静止时取平均并定住 ----
@@ -600,6 +606,10 @@ def line_for(st: dict) -> str:
         tail = f"（风速 {sp:g} m/s）" if sp is not None else ""
         return f"{st.get('message', '识别中…')}{tail}"
     w = st["wind"]
+    rng = st.get("speed_range")
+    if st.get("speed") is None and rng:
+        return (f"风速 {rng[0]}-{rng[1]} m/s（数字未读出，按箭头颜色档显示）| "
+                f"夹角 {w['theta_deg']:.1f}° | 横向/纵向算不了")
     return (f"风 {w['speed']:g} m/s | 夹角 {w['theta_deg']:.1f}° | "
             f"横向 {w['lateral_abs']:.2f} {w['lateral_dir']} | "
             f"纵向 {w['longitudinal_abs']:.2f} {w['longitudinal_dir']}")
@@ -625,12 +635,24 @@ def print_test_report(st: dict, rgb) -> None:
             print(f"读数字      : {ocr['raw']}  选框={ocr.get('box')}")
     else:
         w = st["wind"]
-        print(f"风速        : {w['speed']:g} m/s")
+        sp, rng, note = st.get("speed"), st.get("speed_range"), st.get("speed_note") or ""
+        if sp is None and rng:
+            # 只认出颜色档：风速降级成区间（方向照给，分量算不了）
+            print(f"风速        : {rng[0]}-{rng[1]} m/s（数字未读出，按箭头颜色档显示）")
+        else:
+            print(f"风速        : {sp:g}{'?' if note else ''} m/s")
+        if st.get("cands"):
+            print("数字候选    : " + "  ".join(
+                f"{v}{'' if strong else '~'}({s:.2f},{n or '无档'})"
+                for v, s, strong, n in st["cands"][:5]))
         print(f"画面夹角 φ  : {st['phi']:.1f}°   （俯视压缩 k={st['k']:.3f}）")
         print(f"风向夹角 θ  : {w['theta_deg']:.1f}°  {w['compass']}"
               f"   （cos={w['cos']:.4f}  sin={w['sin']:.4f}）")
-        print(f"横向风速    : {w['lateral_abs']:.2f} m/s {w['lateral_dir']}")
-        print(f"纵向风速    : {w['longitudinal_abs']:.2f} m/s {w['longitudinal_dir']}")
+        if "lateral_abs" in w:
+            print(f"横向风速    : {w['lateral_abs']:.2f} m/s {w['lateral_dir']}")
+            print(f"纵向风速    : {w['longitudinal_abs']:.2f} m/s {w['longitudinal_dir']}")
+        else:
+            print("横向/纵向   : 风速未定（只有颜色档）→ 算不了")
         print(f"耗时        : {st.get('latency_ms', 0):.0f} ms")
     if not st.get("ok") and st.get("dial") is None:
         print("\n提示：请让游戏停在「瞄准 / 击球前」的画面（右上/左上角有风盘），再跑一次。")

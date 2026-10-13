@@ -538,6 +538,16 @@ def wind_range(band: tuple[float, float, float, float]) -> tuple[int, int]:
     return 1, MAX_WIND
 
 
+def band_name(band: tuple[float, float, float, float] | None) -> str:
+    """色带 → 档位名（青 / 黄 / 品红）；认不出来的色带返回空串。日志和界面都用它。"""
+    if band is None:
+        return ""
+    for _lo, _hi, name, (h0, h1), smin, vmin in WIND_COLORS:
+        if (h0, h1, smin, vmin) == tuple(band):
+            return name
+    return ""
+
+
 def _dial_box(dial: Dial, shape, pad_frac: float = 0.35) -> tuple[int, int, int, int]:
     """风盘（往外放一点）在画面里的裁剪框。"""
     pad = dial.r * pad_frac
@@ -1931,6 +1941,9 @@ class FrameReading:
     ok: bool = False
     no_wind: bool = False
     speed: float | None = None
+    speed_note: str = ""               # ""=确定；"?"=数字只是勉强过线，显示时带问号
+    speed_range: tuple | None = None   # 只认出颜色档、数字读不出：给区间（如 (6,10)），分量算不了
+    cands: list = field(default_factory=list)   # 数字候选表 [(值, 分数, 是否严格过关, 档名)]
     message: str = ""
     dial: Dial | None = None
     arrow: ArrowReading | None = None
@@ -1954,6 +1967,9 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
     """
     fr = FrameReading(dial=dial)
     ss = max(1, int(supersample or SUPERSAMPLE))
+    weak = False                                 # 数字只是"勉强过线"（best_effort）读出来的
+    band_hint = None                             # 箭头自己的颜色档（读数字用，也是区间显示的来源）
+    boxes: list | None = None                    # 文字行候选框（一帧只搜一次，多轮复用）
     if speed is None and do_ocr:
         boxes = _find_text_lines(rgb, dial)          # 一帧只搜一次文字行候选，下面几轮复用
         # ① 先看箭头颜色 ⇒ 风速在哪一档，再让数字在这个窄范围里认。
@@ -1969,26 +1985,52 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
                 return lo <= v <= hi
 
             ocr = ocr_speed(rgb, dial, state=ocr_state, allow=in_band, boxes=boxes)
-            if ocr.get("value") is None:            # 严格判据没过 → 在该档里挑最像的
+            strong = ocr.get("value") is not None   # 严格判据（绝对分 ≥0.60 且与次高差 ≥0.10）过关
+            if not strong:                          # 严格没过 → 在这一档里挑最像的
                 ocr = ocr_speed(rgb, dial, state=ocr_state, allow=in_band,
                                 best_effort=True, boxes=boxes)
             fr.ocr = ocr
             if ocr.get("value") is not None:
+                weak = not strong                   # 勉强过线 → 读数要带问号显示（见 speed_note）
+                fr.cands.append([int(ocr["value"]), float(ocr.get("conf") or 0.0),
+                                 bool(strong), band_name(band_hint)])
                 speed = float(ocr["value"])
         if speed is None:                           # 没看出颜色 / 这一档读不出 → 老的全区间读法
             ocr = ocr_speed(rgb, dial, state=ocr_state, boxes=boxes)
-            fr.ocr = ocr
+            if fr.ocr is None or ocr.get("value") is not None:
+                fr.ocr = ocr
             if ocr.get("value") is not None:
+                fr.cands.append([int(ocr["value"]), float(ocr.get("conf") or 0.0), True, ""])
                 speed = float(ocr["value"])
-    if speed is None:
+        if speed is None:
+            # 还是读不出：把**另外两档**也各读一次，只为凑出"到底在每一档里读成了什么"的候选表
+            # （日志/界面要显示它）。放在失败路里，正常帧一次都不会多跑。
+            for lo2, hi2, name2, (h0, h1), smin, vmin in WIND_COLORS:
+                if band_hint is not None and (h0, h1, smin, vmin) == tuple(band_hint):
+                    continue                        # 这一档上面刚试过
+
+                def in2(v, lo2=lo2, hi2=hi2):
+                    return lo2 <= v <= hi2
+
+                r2 = ocr_speed(rgb, dial, state=ocr_state, allow=in2, boxes=boxes)
+                strong2 = r2.get("value") is not None
+                if not strong2:
+                    r2 = ocr_speed(rgb, dial, state=ocr_state, allow=in2,
+                                   best_effort=True, boxes=boxes)
+                if r2.get("value") is not None:     # 没严格过关的会带 "~" 标记出现在候选表里
+                    fr.cands.append([int(r2["value"]), float(r2.get("conf") or 0.0),
+                                     bool(strong2), name2])
+    if speed is None and band_hint is None:
         fr.message = "风速未识别（等待下一次读取）"
         return fr
-    fr.speed = float(speed)
-    if abs(fr.speed) < 1e-9:
+    fr.speed = None if speed is None else float(speed)
+    fr.speed_note = "?" if weak else ""
+    if fr.speed is not None and abs(fr.speed) < 1e-9:
         fr.ok, fr.no_wind, fr.speed = True, True, 0.0
         fr.message = "风速 0 m/s —— 无风，按规则跳过计算"
         return fr
-    band = wind_color(fr.speed)          # 先有风速，才知道箭头该是什么颜色
+    # 数字读出来 → 用数字对应的颜色；数字没读出但箭头颜色认出来了 → 用箭头自己的颜色
+    band = wind_color(fr.speed) if fr.speed is not None else band_hint
     arrow = measure_arrow(rgb, hsv, dial, supersample=ss, band=band)
     if arrow is None and band is not None:
         # 采集卡把颜色洗淡时（色相还在、S/V 不达标），先用放宽门槛的同一档色带再试一次，
@@ -2015,6 +2057,9 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
             if ocr2.get("value") is not None:
                 fr.ocr = ocr2
                 fr.speed = float(ocr2["value"])
+                fr.speed_note = "?"                 # 这条是"跟箭头颜色对不上、换一档重读"来的，存疑
+                fr.cands.append([int(ocr2["value"]), float(ocr2.get("conf") or 0.0),
+                                 False, band_name(full)])
                 band = wind_color(fr.speed)
                 arrow = alt
             break
@@ -2034,5 +2079,13 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
     k = dial.k
     theta = apparent_to_true(arrow.phi, k)
     fr.ok, fr.arrow, fr.phi, fr.k, fr.theta = True, arrow, arrow.phi, k, theta
-    fr.wind = wind_metrics(fr.speed, theta)
+    if fr.speed is None:
+        # 数字读不出、但箭头颜色认出来了：风速**降级成区间**显示，方向照样给（分量算不了）。
+        # 这就是"数字置信度低/读不出"时窗口该有的样子：`11-15 m/s` + 风向箭头。
+        fr.speed_range = wind_range(band)
+        fr.wind = wind_metrics(None, theta)
+        fr.message = (f"数字未读出：风速按 {band_name(band)}档 "
+                      f"{fr.speed_range[0]}-{fr.speed_range[1]} m/s 显示，方向照给")
+    else:
+        fr.wind = wind_metrics(fr.speed, theta)
     return fr

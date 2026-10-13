@@ -186,8 +186,11 @@ GAP = 10                       # 同一行里两项之间的间距（两行共�
 MIN_SCALE = 0.5
 MAX_SCALE = 4.0
 SCALE_STEP = 1.1               # 滚轮/菜单每次缩放比例
-# 量窗口尺寸用的"最长一行"样本（定死尺寸，文字变长也不会跑出屏幕）
-SAMPLES = (("↘  15 m/s", "+179.9°", "→ 13.55", "↑ 13.55"),   # 正常结果的最宽一拍
+# 量窗口尺寸用的"最长一行"样本（定死尺寸，文字变长也不会跑出屏幕）。
+# 箭头字形用 "→"：八个方向箭头里 → ↗ ← ↙ 都是最宽的（实测 24px，↓ ↑ 只有 18px），
+# 拿它量才不会被"换了方向就顶出窗口"咬到（1.1.20 实测过：用 ↘ 量，换成 → 会差 6px）。
+SAMPLES = (("→  15 m/s", "+179.9°", "→ 13.55", "↑ 13.55"),   # 正常结果的最宽一拍
+           ("→  11-15 m/s", "+179.9°", "", ""),               # 只认出颜色档：三段区间里最长的 11-15
            ("·  0 m/s（无风）", "", "", ""))                   # 无风提示
 
 
@@ -340,6 +343,16 @@ class Reader(threading.Thread):
                 where += f" k={d.k:.3f}"
                 if arrow is not None and getattr(arrow, "source", ""):
                     where += f" 掩膜={arrow.source}({arrow.n_pixels}px)"
+                # 判定：带 "?" = 数字勉强过线；"(区间)" = 只认出颜色档
+                if st.get("speed_range"):
+                    sp_txt = f"{st['speed_range'][0]}-{st['speed_range'][1]}(区间)"
+                else:
+                    sp_txt = f"{st.get('speed')}{st.get('speed_note') or ''}"
+                where += f" 判定={sp_txt}"
+                if st.get("cands"):                  # 候选表：带 "~" 的是没严格过关的
+                    where += " 候选=" + "/".join(
+                        f"{v}{'' if strong else '~'}({s:.2f},{n or '无档'})"
+                        for v, s, strong, n in st["cands"][:4])
             ocr = st.get("ocr") or {}
             if ocr.get("box"):
                 where += f" 数字框{ocr['box']}"
@@ -782,17 +795,36 @@ class Overlay:
             # 小行：横向 / 纵向分量
             # 数字部分统一用当前风速档位的颜色
             ang = w.get("theta_signed_deg", w["theta_deg"])
-            col = speed_color(w["speed"])
-            self.l_wind.config(text=f"{wind_arrow(w['theta_deg'])}  {w['speed']:g} m/s",
+            # 低置信度的显示语义（数字识别不确定时怎么显示）：
+            #   "7? m/s"           数字读出来了，但只是勉强过线 → 带问号提醒这拍存疑
+            #   "6-10 m/s"         只认出箭头的颜色档、数字没读出 → 给区间，方向照样显示
+            #   "? m/s（风速未知）"  连颜色档都没有 → 只给方向
+            sp, rng, note = st.get("speed"), st.get("speed_range"), st.get("speed_note") or ""
+            if sp is None and rng:
+                sp_txt, col = f"{rng[0]}-{rng[1]} m/s", DIM
+            elif sp is None:
+                # 连颜色档都没认出来（正常流程走不到这里，留着当兜底）：只给方向、速度打问号。
+                # 不写"（风速未知）"那种长句 —— 窗口宽度是按"最长一行"定死的，长句会被切掉，
+                # 反而连方向都看不清；详情走日志/终端。
+                sp_txt, col = "? m/s", DIM
+            else:
+                sp_txt, col = f"{sp:g}{'?' if note else ''} m/s", speed_color(sp)
+            self.l_wind.config(text=f"{wind_arrow(w['theta_deg'])}  {sp_txt}",
                                fg=col, font=self.font)
             self.l_ang.config(text=f"{ang:+.1f}°", font=self.font)
-            # 第二行沿用第一行的排法：箭头 + 两个空格 + 数值
-            # 颜色各自按**自己的数值**取档位（横向 7 → 黄、纵向 12 → 品红），不是跟着总风速
-            self.l_lat.config(text=f"{LAT_ARROW.get(w['lateral_dir'], '·')}  {w['lateral_abs']:.2f}",
-                              fg=speed_color(w["lateral_abs"]), font=self.font)
-            self.l_lon.config(text=f"{LON_ARROW.get(w['longitudinal_dir'], '·')}  {w['longitudinal_abs']:.2f}",
-                              fg=speed_color(w["longitudinal_abs"]), font=self.font)
-            self.lat_now = w["lateral_abs"]           # 横风 → 给下面的乘法器用
+            if "lateral_abs" in w:
+                # 第二行沿用第一行的排法：箭头 + 两个空格 + 数值
+                # 颜色各自按**自己的数值**取档位（横向 7 → 黄、纵向 12 → 品红），不是跟着总风速
+                self.l_lat.config(text=f"{LAT_ARROW.get(w['lateral_dir'], '·')}  {w['lateral_abs']:.2f}",
+                                  fg=speed_color(w["lateral_abs"]), font=self.font)
+                self.l_lon.config(text=f"{LON_ARROW.get(w['longitudinal_dir'], '·')}  {w['longitudinal_abs']:.2f}",
+                                  fg=speed_color(w["longitudinal_abs"]), font=self.font)
+                self.lat_now = w["lateral_abs"]       # 横风 → 给下面的乘法器用
+            else:
+                # 风速只有一个区间 → 分量算不了。留空位，不能显示成 0.00（会被当成真值）
+                self.l_lat.config(text="—", fg=DIM, font=self.font)
+                self.l_lon.config(text="", fg=DIM, font=self.font)
+                self.lat_now = None
             self._calc()
 
     def _line1(self, text: str, color: str) -> None:
