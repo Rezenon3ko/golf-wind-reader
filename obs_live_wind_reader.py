@@ -96,6 +96,7 @@ WIND_MEASURE_S = 5.0               # 看到风向盘后先正常测这么久，�
 #   值得留 —— 真正该解决"瞄得快"的办法是"某一拍置信度特别高就立刻锁"，而不是缩小窗口。）
 WIND_UNLOCK_S = 30.0               # 风向盘消失超过这么久（时限，暂定）→ 判定进入下一洞 → 解锁重新测
 LOCK_BREAK_RUN = 6                 # 锁定期间"独立读数连续落在另一档"这么多拍 → 认为换洞了（安全网）
+HOLE_HOLD_S = 2.0                  # 洞口力度：短暂量不出来时沿用上一拍结果，免得小窗闪
 # ---- 锁定前"拿不准就问人" ----
 # 5 秒测完，如果读数不够一边倒，就先别锁，把前几名当**备选**弹出来让玩家点一个。
 # 判据两条（满足任一条就问）：
@@ -441,6 +442,8 @@ class Recognizer:
         self.choice_hint = ""                          # 弹窗标题里的那句（"风速拿不准" / "数字没读出"）
         self.ask_since: float | None = None            # 备选弹出来的时刻（超时自动锁用）
         self.band_asked = False                        # "数字读不出"那组备选已经问过且被晾着 → 别再弹
+        self.hole: dict | None = None                  # 上一次算出来的洞口力度（短暂丢检时沿用）
+        self.hole_t = 0.0
         self.ocr = W.OcrState()          # 字形模板库状态独立
         n = W.load_glyph_bank(GLYPH_BANK, state=self.ocr)
         if not n:
@@ -626,16 +629,26 @@ class Recognizer:
         self.lock_event = ""                      # 每帧清空：状态切换的那一句话只报一次
         self.lock_mismatch = ""                    # 同上：锁定值与这一拍打架的说明
         h, w = rgb.shape[:2]
+        # ---- 洞口力度：只吃小地图那一块，跟风盘无关 ----
+        # 放在最前面：推杆界面没有风盘（下面会直接 return "未找到风盘"），但小地图照样在，
+        # 那段也得算。短暂量不出来（挥手遮挡/切 UI）就沿用上一拍，别让小窗闪。
+        hole = W.read_hole_power(rgb, side=self.side)
+        if hole is not None:
+            self.hole, self.hole_t = hole, time.time()
+        elif self.hole is not None and time.time() - self.hole_t <= HOLE_HOLD_S:
+            hole = self.hole
         if self.dial is None or self.shape != (h, w):
             if time.time() - self.last_locate_t < RELOCATE_S:
                 self._wind_gone()
                 return {"ok": False, "message": "未找到风盘",
-                        "speed_locked": self.locked is not None, "lock_event": self.lock_event}
+                        "speed_locked": self.locked is not None, "lock_event": self.lock_event,
+                        "hole_power": hole}
             self.last_locate_t = time.time()
             if not self.locate(rgb):
                 self._wind_gone()
                 return {"ok": False, "message": "未找到风盘",
-                        "speed_locked": self.locked is not None, "lock_event": self.lock_event}
+                        "speed_locked": self.locked is not None, "lock_event": self.lock_event,
+                        "hole_power": hole}
 
         d = self.dial
         assert d is not None
@@ -664,7 +677,8 @@ class Recognizer:
         if fr.speed is None and not fr.speed_range and fr.arrow is None:
             return {"ok": False, "message": "风速未识别（等待下一次读取）",
                     "dial": d, "ocr": fr.ocr,
-                    "speed_locked": self.locked is not None, "lock_event": self.lock_event}
+                    "speed_locked": self.locked is not None, "lock_event": self.lock_event,
+                    "hole_power": hole}
         if fr.no_wind:
             self.no_wind = True
             self.dial_t = time.time()             # 0 m/s 也是"风盘在"：别把它算成消失
@@ -676,10 +690,11 @@ class Recognizer:
                 self._unlock()
             return {"ok": True, "no_wind": True, "speed": 0.0, "dial": d,
                     "message": fr.message,
-                    "speed_locked": False, "lock_event": self.lock_event}
+                    "speed_locked": False, "lock_event": self.lock_event, "hole_power": hole}
         if not fr.ok:
             return {"ok": False, "message": fr.message, "speed": fr.speed, "dial": d,
-                    "speed_locked": self.locked is not None, "lock_event": self.lock_event}
+                    "speed_locked": self.locked is not None, "lock_event": self.lock_event,
+                    "hole_power": hole}
 
         # ---- 这一帧确实看到了风向盘：先更新锁定状态，再用锁定值覆盖风速 ----
         self.dial_t = time.time()
@@ -707,7 +722,7 @@ class Recognizer:
                 "speed_note": fr.speed_note, "speed_range": fr.speed_range,
                 "cands": fr.cands,
                 "speed_locked": self.locked is not None, "lock_event": self.lock_event,
-                "lock_mismatch": self.lock_mismatch,
+                "lock_mismatch": self.lock_mismatch, "hole_power": hole,
                 "arrow_band": fr.arrow_band,
                 "need_choice": bool(self.choice_options) and self.locked is None,
                 "choice_options": self.choice_options or [],

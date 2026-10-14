@@ -1955,7 +1955,158 @@ def wind_metrics(speed: float | None, theta: float) -> dict:
 
 
 # --------------------------------------------------------------------------
-# 6. 顶层分析流程
+# 6. 洞口力度（小地图）
+# --------------------------------------------------------------------------
+# 要算的东西：**洞口在瞄准线的第几格**（力度）。同一洞风速固定，但"这个洞要几力"
+# 每杆都在变，所以是实时算的。
+#
+# 游戏小地图上本来就把要素画全了（实测 8/9 两张真帧）：
+#   · 玩家 = 一个黄色小三角（还有个更大的黄箭头是右下角风向徽章里的，要排除）
+#   · 瞄准线 = 青色分段线，上面有白色刻度点，**相邻两点间距 = 1.0 力**
+#   · 线末端一个黄点 = 4.0 力（满力）
+#   · 洞口 = 旗杆根部那个黑椭圆的中心（红旗面是品红三角，黑椭圆在它正下方）
+# 于是：  力度 = 4.0 × |玩家→洞口| / (4 × 刻度间距)
+#
+# 刻度间距每帧现量（实测两帧 54.8 / 67.2px 不一样 —— 瞄准线长度随杆变化，写死必错）。
+MINIMAP_W_FRAC = 0.193      # 小地图面板宽 / 画面宽（面板在风盘正下方、与风盘同轴心）
+MINIMAP_H_FRAC = 0.431      # 面板高 / 画面高
+MINIMAP_TOP_FRAC = 0.319    # 面板顶边 / 画面高
+HOLE_MAX_POWER = 4.0        # 满力（所有杆都是 4.0）
+HOLE_UNIT_RANGE = (25.0, 130.0)   # "1.0 力"对应像素长度的合理区间，超出当误检
+HOLE_MAX_OUT = 8.0          # 算出来超过它当误检丢掉（正常洞不会差这么多）
+
+
+def _minimap_box(shape, fx: float) -> tuple[int, int, int, int]:
+    """小地图面板的裁剪框：水平中心与风盘同轴（右手 0.8802W / 左手 0.1198W）。"""
+    h, w = shape[:2]
+    cx = fx * w
+    hw = MINIMAP_W_FRAC * w / 2.0
+    y0 = MINIMAP_TOP_FRAC * h
+    return (int(max(cx - hw, 0)), int(max(y0, 0)),
+            int(min(cx + hw, w)), int(min(y0 + MINIMAP_H_FRAC * h, h)))
+
+
+def read_hole_power(rgb: np.ndarray, side: str | None = None) -> dict | None:
+    """
+    算"洞口位于多少力处"：小地图上量玩家→洞口的距离，用瞄准线刻度换算成力度。
+
+    side="右"/"左" 时只看那一侧的小地图（小地图在风盘正下方，左右手镜像）。
+    side=None 时两侧都试 —— 推杆界面没有风盘、调用方还不知道左右手，就得靠这一步自己找。
+    返回 dict(power, unit, dist_px, player, hole, n_dots, side, box)，找不到返回 None。
+    """
+    for name, (fx, _fy, _fr) in GAUGE_PRIORS:
+        if side is not None and name != side:
+            continue
+        box = _minimap_box(rgb.shape, fx)
+        got = _hole_power_in(rgb, box)
+        if got is not None:
+            got["side"] = name
+            return got
+    return None
+
+
+def _hole_power_in(rgb: np.ndarray, box: tuple[int, int, int, int]) -> dict | None:
+    """在给定的小地图裁剪框里量一次（见 read_hole_power 的注释）。"""
+    x0, y0, x1, y1 = box
+    if x1 - x0 < 80 or y1 - y0 < 80:
+        return None
+    sub = rgb[y0:y1, x0:x1]
+    hs = rgb_to_hsv(sub)
+    H, S, V = hs[..., 0], hs[..., 1], hs[..., 2]
+
+    # ① 瞄准线（青色分段）→ 主轴方向 + 靠玩家那一端。
+    # 掩膜要紧：小地图上还有**水/河**（H≈206、V≈0.64）和玩家头像的青圈（S 只有 0.5 左右），
+    # 放宽会把它们一起圈进来、主轴直接歪掉（实测过：3.png 的"线起点"被拽到 323 去）。
+    # 实测瞄准线本体 H≈181~184、S≈0.77~0.87、V≈0.90~0.93，且**每一段都是细长条**
+    # （elong 26~124），所以再加一条形状过滤：细长 + 够长。
+    comps = []
+    for c in label_components((H >= 176.0) & (H <= 196.0) & (S >= 0.65) & (V >= 0.85),
+                              keep_pixels=True, min_area=30):
+        # 形状判据必须用 **PCA 细长度**，不能用外接框长宽比：瞄准线常常是斜的，
+        # 斜向线段的包围盒接近正方（实测 8.png 的段是 31×35），按 bbox 判会全部误杀 ——
+        # 之前 5/7/8 三帧量不出来就是这个原因。细长度对斜线免疫（线段 ~26~124，圆斑 ~2）。
+        pts = np.asarray(c.pixels, dtype=float)
+        X = pts - pts.mean(axis=0)
+        ev = np.linalg.eigvalsh(X.T @ X / max(len(X), 1))
+        if ev[0] > 1e-9 and ev[1] / ev[0] >= 8.0:
+            comps.append(c)
+    if not comps:
+        return None
+    L = np.vstack([np.asarray(c.pixels, dtype=float) for c in comps])
+    c0 = L.mean(axis=0)
+    _ew, vecs = np.linalg.eigh(np.cov((L - c0).T))
+    axis = vecs[:, -1]
+    if axis[1] < 0:
+        axis = -axis                     # 让它指向画面下方（玩家那一侧）
+    perp = np.array([-axis[1], axis[0]])
+    t = (L - c0) @ axis
+    origin = c0 + axis * float(t.max())
+
+    # ② 白刻度点 → 1.0 力 = 相邻两点间距（这就是每帧现量的那个 s）
+    dots = []
+    for c in label_components((V >= 0.85) & (S <= 0.20), keep_pixels=True, min_area=16):
+        if c.area > 340 or not (5 <= c.w <= 20) or abs(c.w - c.h) > 5:
+            continue                     # 太大/太扁的都不是刻度点（面板边框、文字）
+        q = np.array([c.pixels[:, 0].mean(), c.pixels[:, 1].mean()])
+        if abs(float((q - c0) @ perp)) > 9.0:
+            continue                     # 不在线上
+        dots.append((float((q - c0) @ axis), q))
+    if len(dots) < 2:
+        return None                      # 量不出刻度就没法换算力度
+    dots.sort(key=lambda z: -z[0])
+    unit = float(np.median(np.diff([-a for a, _ in dots])))
+    if not (HOLE_UNIT_RANGE[0] <= unit <= HOLE_UNIT_RANGE[1]):
+        return None
+
+    # ③ 玩家 = 离瞄准线起点最近的**小**黄块（那个三角）。
+    #    要排掉两个坑：右下角风向徽章里的黄箭头更大（面积 >300），线上 4.0 那个黄点虽小
+    #    但离起点远（一个刻度以上）。
+    player = None
+    best_d = None
+    for c in label_components((H >= 40.0) & (H <= 64.0) & (S >= 0.60) & (V >= 0.70),
+                              keep_pixels=True, min_area=60):
+        if c.area >= 300:
+            continue
+        q = np.array([c.pixels[:, 0].mean(), c.pixels[:, 1].mean()])
+        d = float(np.hypot(*(q - origin)))
+        if d > 2.5 * unit:                # 线从球画起、三角标在人身上，两者本来就有间隔；
+                                          # 2.5 个刻度足够松，又能把线末端那个 4.0 黄点挡在外面
+            continue
+        if best_d is None or d < best_d:
+            best_d, player = d, q
+    if player is None:
+        return None
+
+    # ④ 旗子（品红三角）→ 洞口 = 旗面**正下方**那个黑椭圆（旗杆根部）的中心。
+    #    注意不能"取旗子附近最大的暗块"：旗子上方的地图暗色地形/水面更大，会取错。
+    flags = label_components((H >= 300.0) & (H <= 348.0) & (S >= 0.50) & (V >= 0.70),
+                             keep_pixels=True, min_area=100)
+    if not flags:
+        return None
+    fc = max(flags, key=lambda c: c.area)
+    fcx = (fc.x0 + fc.x1) / 2.0
+    win = np.zeros(V.shape, dtype=bool)
+    win[int(fc.y1):min(int(fc.y1) + 90, V.shape[0]),
+        max(int(fcx) - 30, 0):min(int(fcx) + 30, V.shape[1])] = True
+    dark = win & (V <= 0.38)
+    ys, xs = np.nonzero(dark)
+    if len(xs) < 20:
+        return None
+    hole = np.array([xs.mean(), float(ys.max()) - 3.0])   # 暗块底边往上 3px ≈ 椭圆中心
+
+    # ⑤ 力度
+    dist = float(np.hypot(*(hole - player)))
+    power = HOLE_MAX_POWER * dist / (4.0 * unit)
+    if not (0.0 < power <= HOLE_MAX_OUT):
+        return None
+    return dict(power=round(power, 2), unit=round(unit, 1), dist_px=round(dist, 1),
+                n_dots=len(dots), box=box,
+                player=(round(float(player[0] + x0), 1), round(float(player[1] + y0), 1)),
+                hole=(round(float(hole[0] + x0), 1), round(float(hole[1] + y0), 1)))
+
+
+# --------------------------------------------------------------------------
+# 7. 顶层分析流程
 # --------------------------------------------------------------------------
 
 @dataclass
