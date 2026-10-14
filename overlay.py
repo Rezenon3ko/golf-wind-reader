@@ -187,8 +187,6 @@ def ui_font(size: int, bold: bool = True):
 
 
 HEAD_SIZE = 24                 # 正常显示的字号（两行统一）
-HOLE_SIZE = HEAD_SIZE - 4      # 第四行"洞口力度"的字号：整句长，小一号才塞得进窄窗
-HOLE_SAMPLE = "洞口位于 4.30 力（可能需换杆）"   # 量窗口宽度用的最长文案
 ERROR_SIZE = HEAD_SIZE - 6     # 提示/报错的字号：小一号，Windows 上 24pt 太大、长句会被切
 ERR_MIN_SIZE = 12              # 提示字号的**下限**：放不下就逐级缩小，缩到这么小为止（再小就难认了）
 GAP = 10                       # 同一行里两项之间的间距（两行共用一个值）
@@ -399,11 +397,6 @@ class Reader(threading.Thread):
                     where += " 锁定=" + (_num(sp_val) if st.get("speed_locked") else "未")
                     if st.get("lock_mismatch"):
                         where += f" 独立={st['lock_mismatch']}"
-                    _hp = st.get("hole_power") or {}
-                    where += (" 洞口=" + (f"{_hp['power']:.2f}力"
-                                          f"(s={_hp.get('unit')},d={_hp.get('dist_px')},"
-                                          f"n={_hp.get('n_dots')})"
-                                          if _hp else "—"))
                 ocr = st.get("ocr") or {}
                 if ocr.get("box"):
                     where += f" 数字框{ocr['box']}"
@@ -599,14 +592,6 @@ class Overlay:
         self.ent.bind("<FocusIn>", lambda e: self.ent.selection_range(0, "end"))
         self.ent.bind("<Return>", lambda e: self.root.focus_set())
 
-        # 第四行：洞口力度（比上面三行小一号 —— "洞口位于 4.30 力（可能需换杆）"在 24pt 下要
-        # 354px、主窗只有 257px，20pt 是 295px，窗口宽度只涨 38px 就装得下整句，不用缩写成
-        # "（换杆）"。这一行跟风盘无关：推杆界面显示"未找到风盘"时它照样有值。）
-        self.hrow = tk.Frame(self.root, bg=BG)
-        self.hrow.pack(padx=PAD, pady=(0, 8))
-        self.l_hole = tk.Label(self.hrow, text="", font=self._font_at(HOLE_SIZE), bg=BG, fg=FG)
-        self.l_hole.pack()
-
         # 宽度以第一行为准（第一行居中，左右各留 PAD）；高度取各行的自然高度。
         # 尺寸定死，文字变长也不会跑出屏幕。
         self.win_w = self.win_h = 0
@@ -620,11 +605,6 @@ class Overlay:
                              self.row.winfo_reqwidth() + 2 * PAD,
                              self.calc.winfo_reqwidth() + 2 * PAD)
             self.win_h = max(self.win_h, self.root.winfo_reqheight())
-        # 洞口那行也要参与定宽（用最长的那种写法当样本）
-        self.l_hole.config(text=HOLE_SAMPLE)
-        self.root.update_idletasks()
-        self.win_w = max(self.win_w, self.hrow.winfo_reqwidth() + 2 * PAD)
-        self.win_h = max(self.win_h, self.root.winfo_reqheight())
         self.win_w, self.win_h = max(self.win_w, 200), max(self.win_h, 60)   # 兜底
         self.text_px = max(80, self.win_w - 2 * PAD - 6)   # 第一行提示可用的像素宽
         self.cur_w = self.win_w                          # 当前窗口宽度（提示时会临时加宽）
@@ -637,12 +617,10 @@ class Overlay:
         self.l_ang.config(text="")
         self.l_lat.config(text="")
         self.l_lon.config(text="")
-        self.l_hole.config(text="")
 
         widgets = (self.root, self.head, self.l_wind, self.l_ang,
                    self.row, self.l_lat, self.l_lon,
-                   self.calc, self.l_mul, self.l_eq, self.l_prod,
-                   self.hrow, self.l_hole)
+                   self.calc, self.l_mul, self.l_eq, self.l_prod)
         self._dx = self._dy = None
         self._grip_from = None                        # 拖左下角把手时的起始状态（见 _press/_drag）
         for w in widgets:                             # 拖动
@@ -783,14 +761,11 @@ class Overlay:
         for w in (self.l_wind, self.l_ang, self.l_lat, self.l_lon,
                   self.l_mul, self.l_eq, self.l_prod, self.ent):
             w.config(font=font)
-        # 第四行字号小一号（乘同一个 s，长宽比照旧不变）
-        self.l_hole.config(font=self._font_at(max(8, int(round(HOLE_SIZE * s)))))
         self.pad = max(0, int(round(PAD * s)))     # PAD 默认就是 0（窗口宽 = 第一行宽）
         self.gap = max(2, int(round(GAP * s)))
         self.head.pack_configure(padx=self.pad, pady=(max(1, int(round(6 * s))), 0))
         self.row.pack_configure(padx=self.pad, pady=(0, max(1, int(round(8 * s)))))
         self.calc.pack_configure(padx=self.pad, pady=(0, max(1, int(round(8 * s)))))
-        self.hrow.pack_configure(padx=self.pad, pady=(0, max(1, int(round(8 * s)))))
         self.l_ang.pack_configure(padx=(self.gap, 0))
         self.l_lon.pack_configure(padx=(self.gap, 0))
         self.l_mul.pack_configure(padx=(self.gap, 0))
@@ -870,7 +845,6 @@ class Overlay:
         if kind in ("error", "status"):             # 异常/状态直接顶到第一行
             self.ok = False
             self._choice_popup(None)                # 报错/状态时把备选弹窗收掉（别挂着误导人）
-            self.l_hole.config(text="")             # 连不上 OBS 时洞口数据也没意义，清掉别留旧值
             self._line1(st["text"], ERR if kind == "error" else DIM)
             return
 
@@ -879,15 +853,6 @@ class Overlay:
         #   根本走不到，弹窗等于永远不出现。）
         self._choice_popup(st.get("choice_options") if st.get("need_choice") else None,
                            st.get("choice_hint") or "")
-        # 洞口力度：主窗第四行，跟风盘无关（推杆界面显示"未找到风盘"时也照给）
-        _hp = st.get("hole_power") or {}
-        if _hp:
-            _p = float(_hp.get("power") or 0.0)
-            _over = _p > O.W.HOLE_MAX_POWER
-            self.l_hole.config(text=f"洞口位于 {_p:.2f} 力" + ("（可能需换杆）" if _over else ""),
-                               fg=WARN if _over else FG)
-        else:
-            self.l_hole.config(text="")
         if st.get("no_wind"):
             self.ok = True
             self._line1("·  0 m/s（无风）", DIM)
