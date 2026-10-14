@@ -142,6 +142,9 @@ ENT_BG = "#0e1014"     # 系数输入框的底：比窗口底色再深一点，�
 WARN = "#ffd166"       # 提示色（"风速拿不准，点一个"）
 ACCENT = "#7fd1ff"     # 按钮按下去的底色
 PICK_SIZE = 16         # 备选风速弹窗里面的字号（比主行小一号，别喧宾夺主）
+BTN_BG = "#232833"     # 备选按钮的底色：比窗口底色浅一档，不然半透明叠在游戏上看不见
+PICK_BTN_PADX = 7      # 按钮左右内边距（1 位数一个键帽别太宽）
+PICK_BTN_PADY = 2
 PICK_PAD = 8
 PAD = 0                        # 左右留白；0 = 窗口宽度就是第一行的宽度（第二行字小，顶不出窗口）
 # 风向箭头：按真实夹角 θ（0=正前，顺时针）取 8 向
@@ -927,12 +930,15 @@ class Overlay:
                 w.destroy()
             self._pick_btns = []
             for v, conf, n in opts:
-                b = tk.Button(self._pick_row, text=str(int(v)), width=max(2, len(str(int(v)))),
-                              font=self._font_at(PICK_SIZE), bg=ENT_BG, fg=FG,
-                              activebackground=ACCENT, activeforeground=BG,
-                              relief="flat", bd=0, highlightthickness=0,
-                              cursor="hand2",
-                              command=lambda v=v: self._choose(v))
+                # 用 Label + relief 画"键帽"，不用 Button：窗口是 -alpha 半透明的，扁平按钮
+                # （bg 只比窗口底色深一点点）叠在游戏上几乎看不见，玩家都不知道能点。
+                # Label 的 bd/relief 在 Windows/macOS 上都老实按配置画，边框能保证看得见。
+                b = tk.Label(self._pick_row, text=str(int(v)), font=self._font_at(PICK_SIZE),
+                             bg=BTN_BG, fg=FG, bd=1, relief="solid",
+                             padx=PICK_BTN_PADX, pady=PICK_BTN_PADY, cursor="hand2")
+                b.bind("<Button-1>", lambda e, v=v: self._choose(v))
+                b.bind("<Enter>", lambda e, w=b: w.config(bg=ACCENT, fg=BG))
+                b.bind("<Leave>", lambda e, w=b: w.config(bg=BTN_BG, fg=FG))
                 b.pack(side="left", padx=(0, 6))
                 self._pick_btns.append(b)
             self._pick_key = key
