@@ -1867,6 +1867,21 @@ def _glyph_windows(crop: Image.Image, max_digits: int = 2,
     return out
 
 
+def _span_tainted(win, tainted: list[tuple[int, int]], slack: int = 2) -> bool:
+    """
+    这组列区间是不是压在"没认全"的那一段上（tainted 由 match_glyphs 填）。
+
+    专门挡"多位数被截断成短数"：15 m/s 在 1600×900 下，'5' 的分数 0.78 / 次名 0.73
+    （差 0.05，够不着 0.06 又要 0.80）→ 两位这一组判掉；这时如果允许回落到只认左边的
+    '1'(0.91)，"15" 就变成 "1"。所以凡是与那段有重叠的窗口一律不算 —— 宁可返回"没读出"。
+    """
+    for a, b in win:
+        for ta, tb in tainted:
+            if a - slack <= tb and ta <= b + slack:
+                return True
+    return False
+
+
 def match_glyphs(crop: Image.Image,
                  state: OcrState | None = None,
                  accept=None,
@@ -1897,9 +1912,11 @@ def match_glyphs(crop: Image.Image,
     fallback: tuple[float, str] | None = None
     normed: dict[tuple[int, int], np.ndarray | None] = {}   # 同一个列块只归一化一次
     holes_of: dict[tuple[int, int], int] = {}               # 洞数同理（label_components 不便宜）
+    tainted: list[tuple[int, int]] = []      # "像数字但拿不准"的列区间 —— 见下面 ambig 那段
     for win in _glyph_windows(crop, mask=m):
         out, worst = "", 1.0
         alt_out, alt_worst = "", 1.0
+        ambig = False
         for a, b in win:
             key = (int(a), int(b))
             if key not in normed:            # 各候选窗口大量重叠，同一块别算两遍
@@ -1942,12 +1959,25 @@ def match_glyphs(crop: Image.Image,
             # 0.820 / 次 0.731（差 0.088），和 "8" 差一口气就差 0.01 没够着 0.10，
             # 结果真数字被判掉、反而让杂块钻空子 —— 所以 0.80 以上放宽到 0.06。
             if best < 0.60 or (best - second < 0.06 and best < 0.80):
-                break                       # 这个字形不像数字（m / s / 杂块）→ 换下一组
+                # 两种情况必须分开：
+                #   · best < 0.60 —— 这块根本不像数字（m / s / 杂块）→ 换下一组，
+                #     更短的读数仍然可信（"8m/s" 就是靠这条落到单个 "8" 上的）。
+                #   · "像数字、但和次名咬得太紧" —— 那就**不能**让更短的读数兜底：
+                #     实测 15 m/s 的帧在 1600×900 下，'5' 是 0.78/次 0.73（差 0.05 < 0.06，
+                #     又没到 0.80），两位这一组被判掉之后，代码回落到只认左边的 '1'(0.91)，
+                #     于是 "15" 变成 "1" —— 颜色档认得出时还能被交叉校验挡住，一旦箭头色相
+                #     被采集链洗坏（band=None）就会**直接显示并锁定 1 m/s**（真值 15）。
+                #     所以这种"没认全"的情况记进 tainted：别再用这一段里的任何一部分去凑数，
+                #     宁可不给（上层会降级成颜色区间 / 未读出）。
+                ambig = best >= 0.60
+                break
             out += digit
             worst = min(worst, best)
         else:
-            if accept is None or accept(int(out)):
+            if (accept is None or accept(int(out))) and not _span_tainted(win, tainted):
                 return out, worst           # 整组都匹配上、数值也合理，才算数
+        if ambig and out:
+            tainted.extend(win)             # 这一组的列区间作废（含已匹配上的那几位）
         if best_effort and len(alt_out) == len(win) and alt_worst >= 0.45:
             if fallback is None or alt_worst > fallback[0]:
                 fallback = (alt_worst, alt_out)

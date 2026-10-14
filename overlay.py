@@ -539,6 +539,7 @@ class Overlay:
         self.q: queue.Queue = queue.Queue()
         self.stop = threading.Event()
         self.ok = False
+        self._render_err, self._render_err_t = "", 0.0     # 渲染异常去重（见 _poll）
 
         self.root = tk.Tk()
         self.root.title("风向")
@@ -837,7 +838,16 @@ class Overlay:
         except queue.Empty:
             pass
         if latest is not None:
-            self._render(latest)
+            try:
+                self._render(latest)
+            except Exception as exc:
+                # 渲染出错**绝不能让轮询停摆**：`after` 排在 _render 后面，异常一冒出去就再也
+                # 不排下一拍 → 窗口永久冻在最后一帧；而窗口程序没有终端，玩家一点提示都看不到。
+                # 同一条错误 10 秒只记一次（这一拍 80ms 一次，否则日志会被刷满）。
+                now = time.time()
+                if f"{exc!r}" != self._render_err or now - self._render_err_t > 10.0:
+                    self._render_err, self._render_err_t = f"{exc!r}", now
+                    Reader._log(f"窗口渲染出错（跳过这一帧，继续刷新）：{exc!r}")
         self.root.after(80, self._poll)
 
     def _render(self, st: dict) -> None:
