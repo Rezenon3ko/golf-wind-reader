@@ -139,7 +139,7 @@ FG = "#f2f4f7"
 DIM = "#8b93a1"
 ERR = "#ff6b6b"
 ENT_BG = "#0e1014"     # 系数输入框的底：比窗口底色再深一点，看着像个"槽"
-WARN = "#ffd166"       # 提示色（"风速拿不准，点一个"）
+WARN = "#ffd166"       # 提示色（"风速拿不准，选一个"）
 ACCENT = "#7fd1ff"     # 按钮按下去的底色
 PICK_SIZE = 16         # 备选风速弹窗里面的字号（比主行小一号，别喧宾夺主）
 BTN_BG = "#232833"     # 备选按钮的底色：比窗口底色浅一档，不然半透明叠在游戏上看不见
@@ -925,7 +925,8 @@ class Overlay:
             self._build_pick()
         if key != self._pick_key:
             # 备选或标题变了 → 重建按钮（同一组备选就不重建，免得按钮在手指底下闪）
-            self._pick_title.config(text=f"{hint or '风速拿不准'}，点一个：")
+            pfont = self._font_at(max(10, int(round(PICK_SIZE * self.scale))))
+            self._pick_title.config(text=f"{hint or '风速拿不准'}，选一个：", font=pfont)
             for w in self._pick_btns:
                 w.destroy()
             self._pick_btns = []
@@ -933,7 +934,7 @@ class Overlay:
                 # 用 Label + relief 画"键帽"，不用 Button：窗口是 -alpha 半透明的，扁平按钮
                 # （bg 只比窗口底色深一点点）叠在游戏上几乎看不见，玩家都不知道能点。
                 # Label 的 bd/relief 在 Windows/macOS 上都老实按配置画，边框能保证看得见。
-                b = tk.Label(self._pick_row, text=str(int(v)), font=self._font_at(PICK_SIZE),
+                b = tk.Label(self._pick_row, text=str(int(v)), font=pfont,
                              bg=BTN_BG, fg=FG, bd=1, relief="solid",
                              padx=PICK_BTN_PADX, pady=PICK_BTN_PADY, cursor="hand2")
                 b.bind("<Button-1>", lambda e, v=v: self._choose(v))
@@ -960,19 +961,25 @@ class Overlay:
             p.attributes("-alpha", max(0.88, min(1.0, float(self._alpha) + 0.34)))
         except Exception:
             pass
-        self._pick_title = tk.Label(p, text="风速拿不准，点一个：", font=self._font_at(PICK_SIZE),
+        self._pick_title = tk.Label(p, text="风速拿不准，选一个：", font=self._font_at(PICK_SIZE),
                                     bg=BG, fg=WARN)
-        self._pick_title.pack(padx=PICK_PAD, pady=(PICK_PAD, 4))
+        self._pick_title.pack(pady=(PICK_PAD, 4))
         self._pick_row = tk.Frame(p, bg=BG)
-        self._pick_row.pack(padx=PICK_PAD, pady=(0, PICK_PAD))
+        self._pick_row.pack(pady=(0, PICK_PAD))
         self._pick_btns: list = []
         self.pick = p
         p.withdraw()
 
     def _place_pick(self) -> None:
-        """贴在主窗口正下方；下面放不下就摆到主窗口上方（始终整窗可见）。"""
+        """
+        贴在主窗口正下方；下面放不下就摆到主窗口上方（始终整窗可见）。
+
+        **宽度跟主窗口一致**（不是"内容多宽就多宽"）：两个窗叠在一起边线对齐才像一套东西。
+        宽度定死后，里面的标题和键帽靠 pack 的默认 anchor=center 自动水平居中。
+        """
         self.pick.update_idletasks()
-        w, h = self.pick.winfo_reqwidth(), self.pick.winfo_reqheight()
+        w = max(self.pick.winfo_reqwidth(), self.win_w)
+        h = self.pick.winfo_reqheight()
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         x = self.root.winfo_x()
         y = self.root.winfo_y() + self.cur_h + 4
