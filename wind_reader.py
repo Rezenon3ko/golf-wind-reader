@@ -610,6 +610,10 @@ GAUGE_PRIORS = (("右", GAUGE_PRIOR), ("左", GAUGE_PRIOR_LEFT))
 # 真机 11 张实测抖动 ≤0.5%W/1.2%H，这里给 6%/10%，把"小地图那一带的白色 UI"挡在外面。
 GAUGE_ZONE_TOL_X = 0.06
 GAUGE_ZONE_TOL_Y = 0.10
+# "这一帧到底有没有风盘"的最后一道闸（见 gauge_verified）：
+# 白环覆盖下限 —— 真风盘那圈白环是闭合的（实测 3 帧都 1.00），过场/走位/球在飞时
+# 同一个位置上就是天空/树/草地（实测 0.00）。
+GAUGE_RING_MIN = 0.75
 
 @dataclass
 class Dial:
@@ -988,6 +992,68 @@ def _find_dial_by_prior(rgb: np.ndarray, verbose: bool = False,
     return None
 
 
+def _gauge_ring_cover(rgb: np.ndarray, cx: float, cy: float, r: float,
+                      nbins: int = 72, band: int = 4) -> float:
+    """
+    风盘那圈白环的**覆盖比例**：绕 (cx,cy) 在半径 0.90r~1.02r 上采 72 个方向，
+    看每个方向上有没有"亮且不饱和"的像素（V>0.62、S<0.40）。
+
+    只在这个小窗里算 HSV（整帧 HSV 要 ~70ms），所以它便宜到可以每帧当闸门用。
+    """
+    img_h, img_w = rgb.shape[:2]
+    half = int(r * 1.2)
+    x0, x1 = int(max(cx - half, 0)), int(min(cx + half + 1, img_w))
+    y0, y1 = int(max(cy - half, 0)), int(min(cy + half + 1, img_h))
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return 0.0
+    hsv = rgb_to_hsv(rgb[y0:y1, x0:x1])
+    V, S = hsv[..., 2], hsv[..., 1]
+    vh, vw = V.shape
+    mlx, mly = cx - x0, cy - y0
+    radii = (0.90 * r, 0.94 * r, 0.98 * r, 1.02 * r)
+    hit = 0
+    for i in range(nbins):
+        th = 2.0 * math.pi * i / nbins
+        ca, sa = math.cos(th), math.sin(th)
+        found = False
+        for rho in radii:
+            for dr in range(-band, band + 1):
+                x = int(round(mlx + (rho + dr) * ca))
+                y = int(round(mly - (rho + dr) * sa))
+                if 0 <= x < vw and 0 <= y < vh and V[y, x] > 0.62 and S[y, x] < 0.40:
+                    found = True
+                    break
+            if found:
+                break
+        hit += found
+    return hit / float(nbins)
+
+
+def gauge_verified(rgb: np.ndarray, dial: Dial, verbose: bool = False) -> bool:
+    """
+    最后一道闸：**这一帧到底有没有风盘**。两条都满足才算：
+      ① 半径 r 那圈白环基本闭合（_gauge_ring_cover ≥ GAUGE_RING_MIN）；
+      ② 盘内下方能看到 "Nm/s" 那一行（_find_text_lines 有候选框）。
+
+    为什么必须加这道闸：光看"先验窗里有一团绿"完全不够 —— 走位/球在飞/过场动画时，
+    风盘位置上就是天空、树、草地，照样能凑出一团"绿"，再被当成风盘读出个假风速。
+    实测 18:00 那局的日志：风盘没出现时先报了个假的 (262,219)，读成 1 m/s 锁死，
+    连"左右手"都被锁到左边，之后真风盘（在右）整整半局没被看过一眼。
+    这两条都是固定 UI 版式的一部分，随机背景凑不出来（真机 3 帧：环 1.00 + 文字行在；
+    过场/教程帧：环 0.00）。
+    """
+    cover = _gauge_ring_cover(rgb, dial.cx, dial.cy, dial.r)
+    if cover < GAUGE_RING_MIN:
+        if verbose:
+            print(f"[跳过] 白环覆盖 {cover:.2f} < {GAUGE_RING_MIN} —— 不像风盘")
+        return False
+    if not _find_text_lines(rgb, dial, max_lines=1):
+        if verbose:
+            print(f"[跳过] 白环覆盖 {cover:.2f} 但盘内找不到 Nm/s 那一行 —— 不像风盘")
+        return False
+    return True
+
+
 def find_dials(rgb: np.ndarray, hsv: np.ndarray | None = None,
                verbose: bool = False, side: str | None = None) -> list[Dial]:
     """
@@ -995,7 +1061,7 @@ def find_dials(rgb: np.ndarray, hsv: np.ndarray | None = None,
     side="右"/"左" 时只搜那一侧（调用方锁定左右手后用）。
     """
     d0 = _find_dial_by_prior(rgb, verbose, side)
-    if d0 is not None:
+    if d0 is not None and gauge_verified(rgb, d0, verbose):
         _calibrate_disc(rgb, d0, verbose)
         return [d0]
     if hsv is None:                      # 先验没命中才需要整帧 HSV
@@ -1084,6 +1150,9 @@ def find_dials(rgb: np.ndarray, hsv: np.ndarray | None = None,
     good = [d for d in merged
             if (d.cx - d.r >= -0.05 * d.r and d.cx + d.r <= img_w + 0.05 * d.r
                 and d.cy - d.r >= -0.05 * d.r and d.cy + d.r <= img_h + 0.05 * d.r)]
+    # 最后一道闸（跟先验那条路同一个判据）：白环不闭合、盘内也没有 "Nm/s" 数字行的，
+    # 一律不算风盘 —— 剩下的白环/圆盘/箭头锚点候选本来就最容易撞上背景里的绿影。
+    good = [d for d in good if gauge_verified(rgb, d, verbose)]
     # 统一校准俯视压缩比 k：用盘面实测值，不再吃写死的常数（见 measure_disc_k 注释）。
     for d in good:
         _calibrate_disc(rgb, d, verbose)
@@ -1548,9 +1617,15 @@ def _find_text_lines(rgb: np.ndarray, dial: Dial,
     m = _open_mask((hsv[..., 2] > 0.55) & (hsv[..., 1] < 0.45))
     # 面积下限 0.0035·r²：排掉面板网点小斑点，又不误杀小分辨率下的真文字
     min_area = max(8, int(0.0035 * r * r))
+    # "Nm/s" 必须落在**盘内**（离盘心 ≤0.85r）。白环自己那截白弧也在这一带：它的宽高比
+    # （实测 29×66）和高低都过得了下面那几条，一旦被并进文字行，整行的框会被撑到 79px
+    # （允许 0.18r~0.50r = 21~58px）→ 整行判掉、数字永远读不出。实测 14m/s / 15m/s 两张
+    # 真机帧就是这么丢掉数字的（数字明明好好地印在盘里）。
+    ccx, ccy = dial.cx - x0, dial.cy - y0
     comps = [c for c in label_components(m, keep_pixels=False, min_area=min_area)
              if 0.10 * r <= c.h <= 0.75 * r and c.w >= 2
-             and 0.12 <= c.w / float(c.h) <= 2.8]          # 排除细长分隔线/圆环弧
+             and 0.12 <= c.w / float(c.h) <= 2.8          # 排除细长分隔线/圆环弧
+             and math.hypot(c.cx - ccx, c.cy - ccy) <= 0.85 * r]
     if not comps:
         return []          # 必须返回空列表：调用方是 for...in，返回 None 会 TypeError
     # 按 y 分组成"行"，取总面积最大的一行（真实文字行的面积远大于面板网点斑点）

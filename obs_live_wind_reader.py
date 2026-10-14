@@ -91,13 +91,17 @@ RELOCATE_BAD = 6                   # 连续这么多帧读不出来就丢掉缓�
 HYST = 0.05                        # 横向/纵向 |值| 小于它就沿用上一次方向（0 附近不抖）
 
 # ---- 风速锁定：同一洞的风速是固定的，锁住它就不会因为某一拍数字读错而乱跳 ----
-WIND_MEASURE_S = 5.0               # 看到风向盘后先正常测这么久，再从这几拍里挑"置信度最高"的锁住。
-# ↑ 2 次/秒 ⇒ 大约 10 拍样本。（试过压到 3 秒想过"有人瞄得快"这一层，结论是 5 秒的样本量
-#   值得留 —— 真正该解决"瞄得快"的办法是"某一拍置信度特别高就立刻锁"，而不是缩小窗口。）
+WIND_MEASURE_S = 3.0               # 看到风向盘后先正常测这么久，再从这几拍里挑"置信度最高"的锁住。
+# ↑ 2 次/秒 ⇒ 大约 6 拍样本。（原先 5 秒：玩家从"摆好姿势"到出手常常不到 5 秒，锁还没
+#   定下来就打完了；而且窗口越长，越容易把"某一拍读错"也编进票里。）
+LOCK_MIN_VOTES = 2                 # 至少要有这么多拍读到同一个值才允许锁 —— 单拍不锁。
+# ↑ 天大的坑：锁定判据是"票数×平均置信度"，于是**只有一拍**也能锁。实测 10-14 那局：
+#   风盘还没出现时误抓的假风盘某一拍读成 1 m/s，3 秒后就把它锁死了，之后一直显示错误风速。
+MEASURE_GAP_S = 2.5                # 风盘消失超过这么久 → 这一轮测的票作废，下次出现重新测。
 WIND_UNLOCK_S = 30.0               # 风向盘消失超过这么久（时限，暂定）→ 判定进入下一洞 → 解锁重新测
 LOCK_BREAK_RUN = 6                 # 锁定期间"独立读数连续落在另一档"这么多拍 → 认为换洞了（安全网）
 # ---- 锁定前"拿不准就问人" ----
-# 5 秒测完，如果读数不够一边倒，就先别锁，把前几名当**备选**弹出来让玩家点一个。
+# 测完（WIND_MEASURE_S），如果读数不够一边倒，就先别锁，把前几名当**备选**弹出来让玩家点一个。
 # 判据两条（满足任一条就问）：
 #   ① 第一名的平均置信度 < CHOICE_CONF          —— 谁都不像；
 #   ② 第一名占前两名"置信度之和"的比例 < CHOICE_RATIO —— 两个值咬得很紧。
@@ -475,7 +479,7 @@ class Recognizer:
         """
         风速锁定状态机（只在"这一帧确实看到风向盘"时调一次）。
 
-        怎么锁：看到风向盘后先**正常测 WIND_MEASURE_S 秒**，把这 5 秒里的读数按**值**归并，
+        怎么锁：看到风向盘后先**正常测 WIND_MEASURE_S 秒**，把这几秒里的读数按**值**归并，
         取"置信度之和"最高的那个值锁住 —— 也就是 票数 × 平均置信度。
 
         为什么不是"单拍置信度最高"：单拍高分可能正好是误读。按"和"排就好：读得又多又像的
@@ -505,6 +509,10 @@ class Recognizer:
             if self.votes and now - self.measure_t0 >= WIND_MEASURE_S:
                 ranked = sorted(self.votes.items(), key=lambda kv: (-kv[1][1], -kv[1][0]))
                 v, (n, s) = ranked[0]
+                if n < LOCK_MIN_VOTES:
+                    # 只有孤零零一拍读到它 → 先不锁，继续收票（真在瞄准界面的话下一拍就来第二票）。
+                    # 单拍读错是最常见的"锁错风速"，而锁错之后整洞都在显示错值，代价太大。
+                    return
                 if self._too_close_to_call(ranked):
                     # 拿不准 → 先把备选弹给玩家，等他点；期间继续收票（也继续显示）
                     if self.choice_options is None:
@@ -613,6 +621,12 @@ class Recognizer:
             self.dial_t = now
             return
         gone = now - self.dial_t
+        if self.locked is None and gone > MEASURE_GAP_S and (self.votes or self.measure_t0):
+            # 这一轮测量被打断了（挥杆 / 走位 / 切界面）→ 票作废、重新开始量。
+            # 不清的话，"6 秒前孤零零一拍读错的 1 m/s"会跟回来后新看到的帧拼在一起，
+            # 凑够票数被锁死（实测就是这么锁错整洞的）。
+            self.votes, self.measure_t0 = {}, None
+            self._clear_choice()
         if gone <= WIND_UNLOCK_S:
             return
         self.dial_t = now                             # 重置，免得后面每拍都重复判一次
@@ -639,6 +653,21 @@ class Recognizer:
 
         d = self.dial
         assert d is not None
+
+        # 缓存里的定位会过期：球一飞出去 / 走位 / 过场动画时，风盘的位置上变成天空、树、
+        # 草地，那会儿再按缓存去"读数字"，就会把背景里随便一块白字当成风速读出来（实测
+        # 就这么锁过一个假风速）。所以每帧先确认风盘**真的还在**（白环闭合 + 盘内有 Nm/s
+        # 数字行，实测 ~10ms）。不在了就当"风盘消失"处理，绝不拿过期定位出结果。
+        if not W.gauge_verified(rgb, d):
+            self.bad += 1
+            if self.bad >= RELOCATE_BAD:          # 连续几帧都对不上 → 丢掉缓存重新找
+                self.dial, self.side, self.bad = None, None, 0
+                self.ema = self.shown = None
+                if self.args.verbose:
+                    print("\n[定位] 风盘对不上 → 丢弃缓存，重新定位")
+            self._wind_gone()
+            return {"ok": False, "message": "未找到风盘",
+                    "speed_locked": self.locked is not None, "lock_event": self.lock_event}
 
         # 每帧都重新读风速（模板匹配只要 ~4ms，读准了才知道箭头该是什么颜色）
         fr = W.read_wind(rgb, d, ocr_state=self.ocr)
