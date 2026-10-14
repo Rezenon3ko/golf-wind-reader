@@ -1975,6 +1975,34 @@ HOLE_MAX_POWER = 4.0        # 满力（所有杆都是 4.0）
 HOLE_UNIT_RANGE = (25.0, 130.0)   # "1.0 力"对应像素长度的合理区间，超出当误检
 HOLE_MAX_OUT = 20.0         # 只当误检门槛用：真人打得远、又拿了短杆时 9~15 力都正常
 HOLE_DY = 26.0              # 洞口相对**旗面底边**的纵向偏移（球洞图标是固定图案，实测 ±2px）
+# 认旗子用（见 _flag_pole）：品红不光有旗子，小地图里的风速徽章箭头 11~15 m/s 档也是品红
+FLAG_POLE_S_MAX = 0.25      # 旗杆是近白（S≈0.09）；沙坑是奶油色（S≈0.41）→ 用它把沙坑挡掉
+FLAG_POLE_MIN_H = 10        # 一根杆在窗里至少要有这么多行白像素才算"有杆"
+FLAG_POLE_W_FRAC = 0.22     # "白柱"占窗宽的上限：真旗杆 ~0.07，风速徽章那圈白环 ~0.36
+
+
+def _flag_pole(V: np.ndarray, S: np.ndarray, c: Component) -> tuple[float, int, float] | None:
+    """
+    在旗面正下方那条带里找"白色细杆"，返回 (杆中心 x, 最高列的白像素数, 白柱占窗宽比例)。
+
+    没找到够高的白柱（< FLAG_POLE_MIN_H）就返回 None。
+    "白柱"= 这一列在带里的白像素够多。它存在的意义是区分**旗杆**（3~5px 宽的一根细白线）
+    和**风速徽章的白环**（一整圈粗白环，一大片列都白）—— 只看"有没有白像素"两者都能过，
+    量出来的洞口就会跑到玩家左边去（见 _hole_power_in ④ 的注释）。
+    """
+    y0, y1 = int(c.y1) + 1, min(int(c.y1) + 48, V.shape[0])
+    x0, x1 = max(int(c.x0) - 12, 0), min(int(c.x1) + 12, V.shape[1])
+    if y1 - y0 < FLAG_POLE_MIN_H or x1 - x0 < 8:
+        return None
+    band = (V[y0:y1, x0:x1] >= 0.70) & (S[y0:y1, x0:x1] <= FLAG_POLE_S_MAX)
+    col = band.sum(axis=0)
+    mx = int(col.max())
+    if mx < FLAG_POLE_MIN_H:
+        return None
+    tall = col >= max(FLAG_POLE_MIN_H, int(0.6 * mx))
+    tall_cols, tall_col = np.nonzero(tall)[0], col[tall]
+    pole_x = float((tall_cols * tall_col).sum()) / float(tall_col.sum())   # 按列白像素数加权
+    return pole_x + x0, mx, float(tall_cols.size) / float(col.size)
 
 
 def _minimap_box(shape, fx: float) -> tuple[int, int, int, int]:
@@ -2111,37 +2139,42 @@ def _hole_power_in(rgb: np.ndarray, box: tuple[int, int, int, int]) -> dict | No
     #        就是地图暗色地形，会取到那底下（实测 10-08/10-09 两张截图就这么错的：洞口
     #        偏 60px，力度从 ~4.0 变成 3.06）。
     #    而黑椭圆自己还会被瞄准线/红弧切成好几块。
-    #    所以改用**旗杆的 x**：旗杆是旗面正下方那根白色细线，实测 4 帧它的 x 与真洞口
-    #    差 ≤2px；纵向用固定偏移（球洞图标是固定图案，"旗面底边往下 26px"在 4 帧上只差
+    #    所以改用**旗杆的 x**：旗杆是旗面正下方那根白色细线，实测 5 帧它的 x 与真洞口
+    #    差 ≤4px；纵向用固定偏移（球洞图标是固定图案，"旗面底边往下 26px"在 5 帧上只差
     #    ±2px）。最后再用附近的小黑块（有就用）微调一下。
+    #    第三个坑（实测 12-07 那张真机帧，洞口 20 / 剩余 340y / 11 m/s）：品红不光有旗子 ——
+    #    小地图左下角那个风速徽章里的风向箭头，11~15 m/s 档也是品红，而且它 376px 比真旗面
+    #    331px 还大。按"最大的品红块"选就会把徽章当旗子：量出来的"洞口"落在玩家左边、
+    #    力度从 ~5.7 变成 2.42。两者的区别在**下方那根杆** —— 真旗杆是一根 3~5px 宽的白线
+    #    （白柱占窗宽 ~0.07），徽章箭头下面是它自己那圈白环（一大片列都白、占比 ~0.36）。
+    #    所以现在按"杆够高 + 杆够细"挑，挑不出来就当没旗子，落到下面推杆兜底。
     flags = label_components((H >= 300.0) & (H <= 348.0) & (S >= 0.50) & (V >= 0.70),
                              keep_pixels=True, min_area=100)
     hole = None
-    if flags:
+    cands = []
+    for c in flags:
+        p = _flag_pole(V, S, c)
+        if p is not None and p[2] <= FLAG_POLE_W_FRAC:
+            cands.append((p[2], -c.area, c, p))
+    if cands:
         # ① 瞄准界面：有旗子 ⇒ 用旗杆的 x + 固定纵向偏移（见上面的注释）。
         #    找不到旗杆（推杆界面若误判出一块品红，就会走这条）就当没旗子，落到下面兜底。
-        fc = max(flags, key=lambda c: c.area)
-        zone = np.zeros(V.shape, dtype=bool)
-        yb0, yb1 = int(fc.y1) + 1, min(int(fc.y1) + 50, V.shape[0])
-        for xa, xb in ((fc.x0 - 10, fc.x0 + 8), (fc.x1 - 8, fc.x1 + 10)):
-            zone[yb0:yb1, max(int(xa), 0):min(int(xb), V.shape[1])] = True
-        py, px = np.nonzero(zone & (V >= 0.70) & (S <= 0.45))
-        if len(px) >= 6:                        # 有旗杆才算真旗子
-            hole_x = float(px.mean())
-            hole = np.array([hole_x, float(fc.y1) + HOLE_DY])
-            refine = None                       # 附近的小黑块 = 黑椭圆，有就拿它微调
-            for c in label_components(V <= 0.45, keep_pixels=True, min_area=10):
-                if c.area > 900 or not (0.35 <= c.w / float(max(c.h, 1)) <= 3.0):
-                    continue
-                if c.area < 0.30 * c.w * c.h:
-                    continue
-                q = np.array([c.pixels[:, 0].mean(), c.pixels[:, 1].mean()])
-                if abs(float(q[0]) - hole_x) > 16 or abs(float(q[1]) - hole[1]) > 14:
-                    continue
-                if refine is None or c.area > refine[0]:
-                    refine = (c.area, q)
-            if refine is not None:
-                hole = refine[1]
+        cands.sort(key=lambda z: (z[0], z[1]))   # 杆越细越像旗子；一样细取大的那块
+        _frac, _neg_area, fc, (hole_x, _mx, _f) = cands[0]
+        hole = np.array([hole_x, float(fc.y1) + HOLE_DY])
+        refine = None                           # 附近的小黑块 = 黑椭圆，有就拿它微调
+        for c in label_components(V <= 0.45, keep_pixels=True, min_area=10):
+            if c.area > 900 or not (0.35 <= c.w / float(max(c.h, 1)) <= 3.0):
+                continue
+            if c.area < 0.30 * c.w * c.h:
+                continue
+            q = np.array([c.pixels[:, 0].mean(), c.pixels[:, 1].mean()])
+            if abs(float(q[0]) - hole_x) > 16 or abs(float(q[1]) - hole[1]) > 14:
+                continue
+            if refine is None or c.area > refine[0]:
+                refine = (c.area, q)
+        if refine is not None:
+            hole = refine[1]
     if hole is None:
         # ② 推杆界面：**旗子被拔掉了**，小地图上洞口只剩一个黑点。
         #    注意这个黑点**就在瞄准线上**，但位置不确定：瞄准线的总长是满力 4.0，洞口可以在
