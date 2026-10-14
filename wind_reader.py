@@ -1973,7 +1973,8 @@ MINIMAP_H_FRAC = 0.431      # 面板高 / 画面高
 MINIMAP_TOP_FRAC = 0.319    # 面板顶边 / 画面高
 HOLE_MAX_POWER = 4.0        # 满力（所有杆都是 4.0）
 HOLE_UNIT_RANGE = (25.0, 130.0)   # "1.0 力"对应像素长度的合理区间，超出当误检
-HOLE_MAX_OUT = 8.0          # 算出来超过它当误检丢掉（正常洞不会差这么多）
+HOLE_MAX_OUT = 20.0         # 只当误检门槛用：真人打得远、又拿了短杆时 9~15 力都正常
+HOLE_DY = 26.0              # 洞口相对**旗面底边**的纵向偏移（球洞图标是固定图案，实测 ±2px）
 
 
 def _minimap_box(shape, fx: float) -> tuple[int, int, int, int]:
@@ -2077,22 +2078,41 @@ def _hole_power_in(rgb: np.ndarray, box: tuple[int, int, int, int]) -> dict | No
     if player is None:
         return None
 
-    # ④ 旗子（品红三角）→ 洞口 = 旗面**正下方**那个黑椭圆（旗杆根部）的中心。
-    #    注意不能"取旗子附近最大的暗块"：旗子上方的地图暗色地形/水面更大，会取错。
+    # ④ 旗子（品红三角）→ 洞口（旗杆根部的黑椭圆中心）。
+    #    直接找"黑椭圆"不靠谱，两个坑都踩过：
+    #      · "旗子附近最大的暗块"—— 旗子上方的地图暗色地形/水面更大；
+    #      · "旗面下方那扇窗里最下面的暗像素"—— 旗子在小地图**边缘**时，旗面下方紧邻的
+    #        就是地图暗色地形，会取到那底下（实测 10-08/10-09 两张截图就这么错的：洞口
+    #        偏 60px，力度从 ~4.0 变成 3.06）。
+    #    而黑椭圆自己还会被瞄准线/红弧切成好几块。
+    #    所以改用**旗杆的 x**：旗杆是旗面正下方那根白色细线，实测 4 帧它的 x 与真洞口
+    #    差 ≤2px；纵向用固定偏移（球洞图标是固定图案，"旗面底边往下 26px"在 4 帧上只差
+    #    ±2px）。最后再用附近的小黑块（有就用）微调一下。
     flags = label_components((H >= 300.0) & (H <= 348.0) & (S >= 0.50) & (V >= 0.70),
                              keep_pixels=True, min_area=100)
     if not flags:
         return None
     fc = max(flags, key=lambda c: c.area)
-    fcx = (fc.x0 + fc.x1) / 2.0
-    win = np.zeros(V.shape, dtype=bool)
-    win[int(fc.y1):min(int(fc.y1) + 90, V.shape[0]),
-        max(int(fcx) - 30, 0):min(int(fcx) + 30, V.shape[1])] = True
-    dark = win & (V <= 0.38)
-    ys, xs = np.nonzero(dark)
-    if len(xs) < 20:
-        return None
-    hole = np.array([xs.mean(), float(ys.max()) - 3.0])   # 暗块底边往上 3px ≈ 椭圆中心
+    zone = np.zeros(V.shape, dtype=bool)
+    yb0, yb1 = int(fc.y1) + 1, min(int(fc.y1) + 50, V.shape[0])
+    for xa, xb in ((fc.x0 - 10, fc.x0 + 8), (fc.x1 - 8, fc.x1 + 10)):
+        zone[yb0:yb1, max(int(xa), 0):min(int(xb), V.shape[1])] = True
+    py, px = np.nonzero(zone & (V >= 0.70) & (S <= 0.45))
+    hole_x = float(px.mean()) if len(px) >= 6 else float(fc.x0) - 2.0
+    hole = np.array([hole_x, float(fc.y1) + HOLE_DY])
+    refine = None                               # 附近的小黑块 = 黑椭圆，有就拿它微调
+    for c in label_components(V <= 0.45, keep_pixels=True, min_area=10):
+        if c.area > 900 or not (0.35 <= c.w / float(max(c.h, 1)) <= 3.0):
+            continue
+        if c.area < 0.30 * c.w * c.h:
+            continue
+        q = np.array([c.pixels[:, 0].mean(), c.pixels[:, 1].mean()])
+        if abs(float(q[0]) - hole_x) > 16 or abs(float(q[1]) - hole[1]) > 14:
+            continue
+        if refine is None or c.area > refine[0]:
+            refine = (c.area, q)
+    if refine is not None:
+        hole = refine[1]
 
     # ⑤ 力度
     dist = float(np.hypot(*(hole - player)))
