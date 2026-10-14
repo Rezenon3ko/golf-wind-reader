@@ -187,6 +187,8 @@ def ui_font(size: int, bold: bool = True):
 
 
 HEAD_SIZE = 24                 # 正常显示的字号（两行统一）
+HOLE_SIZE = HEAD_SIZE - 4      # 第四行"洞口力度"的字号：整句长，小一号才塞得进窄窗
+HOLE_SAMPLE = "洞口位于 4.30 力（可能需换杆）"   # 量窗口宽度用的最长文案
 ERROR_SIZE = HEAD_SIZE - 6     # 提示/报错的字号：小一号，Windows 上 24pt 太大、长句会被切
 ERR_MIN_SIZE = 12              # 提示字号的**下限**：放不下就逐级缩小，缩到这么小为止（再小就难认了）
 GAP = 10                       # 同一行里两项之间的间距（两行共用一个值）
@@ -597,6 +599,14 @@ class Overlay:
         self.ent.bind("<FocusIn>", lambda e: self.ent.selection_range(0, "end"))
         self.ent.bind("<Return>", lambda e: self.root.focus_set())
 
+        # 第四行：洞口力度（比上面三行小一号 —— "洞口位于 4.30 力（可能需换杆）"在 24pt 下要
+        # 354px、主窗只有 257px，20pt 是 295px，窗口宽度只涨 38px 就装得下整句，不用缩写成
+        # "（换杆）"。这一行跟风盘无关：推杆界面显示"未找到风盘"时它照样有值。）
+        self.hrow = tk.Frame(self.root, bg=BG)
+        self.hrow.pack(padx=PAD, pady=(0, 8))
+        self.l_hole = tk.Label(self.hrow, text="", font=self._font_at(HOLE_SIZE), bg=BG, fg=FG)
+        self.l_hole.pack()
+
         # 宽度以第一行为准（第一行居中，左右各留 PAD）；高度取各行的自然高度。
         # 尺寸定死，文字变长也不会跑出屏幕。
         self.win_w = self.win_h = 0
@@ -610,6 +620,11 @@ class Overlay:
                              self.row.winfo_reqwidth() + 2 * PAD,
                              self.calc.winfo_reqwidth() + 2 * PAD)
             self.win_h = max(self.win_h, self.root.winfo_reqheight())
+        # 洞口那行也要参与定宽（用最长的那种写法当样本）
+        self.l_hole.config(text=HOLE_SAMPLE)
+        self.root.update_idletasks()
+        self.win_w = max(self.win_w, self.hrow.winfo_reqwidth() + 2 * PAD)
+        self.win_h = max(self.win_h, self.root.winfo_reqheight())
         self.win_w, self.win_h = max(self.win_w, 200), max(self.win_h, 60)   # 兜底
         self.text_px = max(80, self.win_w - 2 * PAD - 6)   # 第一行提示可用的像素宽
         self.cur_w = self.win_w                          # 当前窗口宽度（提示时会临时加宽）
@@ -622,10 +637,12 @@ class Overlay:
         self.l_ang.config(text="")
         self.l_lat.config(text="")
         self.l_lon.config(text="")
+        self.l_hole.config(text="")
 
         widgets = (self.root, self.head, self.l_wind, self.l_ang,
                    self.row, self.l_lat, self.l_lon,
-                   self.calc, self.l_mul, self.l_eq, self.l_prod)
+                   self.calc, self.l_mul, self.l_eq, self.l_prod,
+                   self.hrow, self.l_hole)
         self._dx = self._dy = None
         self._grip_from = None                        # 拖左下角把手时的起始状态（见 _press/_drag）
         for w in widgets:                             # 拖动
@@ -676,9 +693,6 @@ class Overlay:
         # 备选风速的弹窗（"锁定前拿不准就问玩家"用）。懒建：不用的时候一个窗口都不多。
         self.pick: tk.Toplevel | None = None
         self._pick_key: tuple | None = None       # 当前弹窗显示的是哪一组备选（变了就重建）
-        # "洞口位于 x.xx 力"的小窗：独立窗口，跟主窗解耦（见 _hole_popup）
-        self.hole: tk.Toplevel | None = None
-        self._hole_key: tuple | None = None
         self._alpha = args.alpha
         self.reader = Reader(self.q, self.stop)
         self.reader.start()
@@ -769,11 +783,14 @@ class Overlay:
         for w in (self.l_wind, self.l_ang, self.l_lat, self.l_lon,
                   self.l_mul, self.l_eq, self.l_prod, self.ent):
             w.config(font=font)
+        # 第四行字号小一号（乘同一个 s，长宽比照旧不变）
+        self.l_hole.config(font=self._font_at(max(8, int(round(HOLE_SIZE * s)))))
         self.pad = max(0, int(round(PAD * s)))     # PAD 默认就是 0（窗口宽 = 第一行宽）
         self.gap = max(2, int(round(GAP * s)))
         self.head.pack_configure(padx=self.pad, pady=(max(1, int(round(6 * s))), 0))
         self.row.pack_configure(padx=self.pad, pady=(0, max(1, int(round(8 * s)))))
         self.calc.pack_configure(padx=self.pad, pady=(0, max(1, int(round(8 * s)))))
+        self.hrow.pack_configure(padx=self.pad, pady=(0, max(1, int(round(8 * s)))))
         self.l_ang.pack_configure(padx=(self.gap, 0))
         self.l_lon.pack_configure(padx=(self.gap, 0))
         self.l_mul.pack_configure(padx=(self.gap, 0))
@@ -853,7 +870,7 @@ class Overlay:
         if kind in ("error", "status"):             # 异常/状态直接顶到第一行
             self.ok = False
             self._choice_popup(None)                # 报错/状态时把备选弹窗收掉（别挂着误导人）
-            self._hole_popup(None)                  # 洞口小窗同理
+            self.l_hole.config(text="")             # 连不上 OBS 时洞口数据也没意义，清掉别留旧值
             self._line1(st["text"], ERR if kind == "error" else DIM)
             return
 
@@ -862,8 +879,15 @@ class Overlay:
         #   根本走不到，弹窗等于永远不出现。）
         self._choice_popup(st.get("choice_options") if st.get("need_choice") else None,
                            st.get("choice_hint") or "")
-        # 洞口力度：跟风盘无关，推杆界面（没风盘）也照显示
-        self._hole_popup(st.get("hole_power"))
+        # 洞口力度：主窗第四行，跟风盘无关（推杆界面显示"未找到风盘"时也照给）
+        _hp = st.get("hole_power") or {}
+        if _hp:
+            _p = float(_hp.get("power") or 0.0)
+            _over = _p > O.W.HOLE_MAX_POWER
+            self.l_hole.config(text=f"洞口位于 {_p:.2f} 力" + ("（可能需换杆）" if _over else ""),
+                               fg=WARN if _over else FG)
+        else:
+            self.l_hole.config(text="")
         if st.get("no_wind"):
             self.ok = True
             self._line1("·  0 m/s（无风）", DIM)
@@ -1009,76 +1033,6 @@ class Overlay:
             except Exception as exc:
                 Reader._log(f"备选风速递交失败：{exc!r}")
         self._choice_popup(None)
-
-    # ---- 洞口力度：右侧独立小窗（不碰主窗的排版/缩放/拖动）----
-    def _hole_popup(self, info) -> None:
-        """
-        显示 / 更新 / 收起"洞口位于 x.xx 力"的小窗；info=None 时收起。
-
-        又是单独一个 Toplevel：主窗尺寸按"最长一行"定死、还带把手拖拽和滚轮缩放，
-        往里加一行很容易把那些已验证过的行为搞坏（A5：暂时不要动现有结构）。
-        宽度跟主窗一致（主窗贴屏幕右上角，所以它就是"右侧那块"），字体跟着缩放走。
-        """
-        if not info:
-            if self.hole is not None:
-                self.hole.withdraw()
-            self._hole_key = None
-            return
-        power = float(info.get("power") or 0.0)
-        key = (round(power, 2), round(self.scale, 3))
-        if self.hole is None:
-            self._build_hole()
-        if key != self._hole_key:                     # 值或缩放变了才改文字（同一值不重画）
-            font = self._font_at(max(8, int(round(HEAD_SIZE * self.scale))))
-            self.l_hole1.config(text=f"洞口位于 {power:.2f} 力", font=font)
-            # 超过满力 4.0 就提示可能要换杆（A7）
-            hint = "（可能需换杆）" if power > O.W.HOLE_MAX_POWER else ""
-            self.l_hole2.config(text=hint, font=font)
-            # 没提示就把第二行摘掉：留着一个空行会让小窗白高一截（94px vs 60px）
-            if hint:
-                self.l_hole2.pack(pady=(0, PICK_PAD))
-            else:
-                self.l_hole2.pack_forget()
-            self._hole_key = key
-        self.hole.deiconify()
-        self.hole.lift()
-        try:
-            self.hole.attributes("-topmost", True)
-        except Exception:
-            pass
-        self._place_hole()
-
-    def _build_hole(self) -> None:
-        p = tk.Toplevel(self.root)
-        p.overrideredirect(True)
-        p.configure(bg=BG)
-        try:
-            p.attributes("-topmost", True)
-            p.attributes("-alpha", max(0.88, min(1.0, float(self._alpha) + 0.34)))
-        except Exception:
-            pass
-        font = self._font_at(HEAD_SIZE)
-        self.l_hole1 = tk.Label(p, text="", font=font, bg=BG, fg=FG)
-        self.l_hole1.pack(pady=(PICK_PAD, 0))
-        self.l_hole2 = tk.Label(p, text="", font=font, bg=BG, fg=WARN)
-        self.l_hole2.pack(pady=(0, PICK_PAD))
-        self.hole = p
-        p.withdraw()
-
-    def _place_hole(self) -> None:
-        """贴在主窗正下方（备选弹窗在的话就贴它下面），宽度跟主窗一致、整窗可见。"""
-        self.hole.update_idletasks()
-        w = max(self.hole.winfo_reqwidth(), self.win_w)
-        h = self.hole.winfo_reqheight()
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        x = self.root.winfo_x()
-        y = self.root.winfo_y() + self.cur_h + 4
-        if self.pick is not None and self.pick.winfo_ismapped():
-            y = self.pick.winfo_y() + self.pick.winfo_height() + 4
-        if y + h > sh - 8:
-            y = max(0, sh - h - 8)
-        x = max(0, min(x, sw - w - 8))
-        self.hole.geometry(f"{w}x{h}+{int(x)}+{int(y)}")
 
     def _line1(self, text: str, color: str) -> None:
         """
