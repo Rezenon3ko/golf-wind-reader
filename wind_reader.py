@@ -2059,24 +2059,25 @@ def _hole_power_in(rgb: np.ndarray, box: tuple[int, int, int, int]) -> dict | No
     if not (HOLE_UNIT_RANGE[0] <= unit <= HOLE_UNIT_RANGE[1]):
         return None
 
-    # ③ 玩家 = 离瞄准线起点最近的**小**黄块（那个三角）。
-    #    要排掉两个坑：右下角风向徽章里的黄箭头更大（面积 >300），线上 4.0 那个黄点虽小
-    #    但离起点远（一个刻度以上）。
+    # ③ 玩家 = 那个**三角形**：面积最大的小黄块。
+    #    实测 6 帧：三角 138~143px，瞄准线末端那个 4.0 黄点只有 60~91px，右下角风向徽章里的
+    #    黄箭头更大（>460）—— 阈值 300 正好把这三者分开，取"最大的小黄块"就是三角。
+    #    以前是按"离瞄准线起点最近"取的，而那个"起点"是用"线的下端"猜的：推杆界面玩家在
+    #    右上、洞口在左下时直接猜反，玩家/洞口整个对调（实测那张算出来 4.04 但方向反了）。
     player = None
-    best_d = None
+    best_a = 0.0
     for c in label_components((H >= 40.0) & (H <= 64.0) & (S >= 0.60) & (V >= 0.70),
                               keep_pixels=True, min_area=60):
         if c.area >= 300:
             continue
-        q = np.array([c.pixels[:, 0].mean(), c.pixels[:, 1].mean()])
-        d = float(np.hypot(*(q - origin)))
-        if d > 2.5 * unit:                # 线从球画起、三角标在人身上，两者本来就有间隔；
-                                          # 2.5 个刻度足够松，又能把线末端那个 4.0 黄点挡在外面
-            continue
-        if best_d is None or d < best_d:
-            best_d, player = d, q
+        if c.area > best_a:
+            best_a = c.area
+            player = np.array([c.pixels[:, 0].mean(), c.pixels[:, 1].mean()])
     if player is None:
         return None
+    # 线的另一头（离玩家远的那端）：推杆兜底找黑点要用
+    e1, e2 = c0 + axis * float(t.max()), c0 + axis * float(t.min())
+    far = e1 if float(np.hypot(*(e1 - player))) > float(np.hypot(*(e2 - player))) else e2
 
     # ④ 旗子（品红三角）→ 洞口（旗杆根部的黑椭圆中心）。
     #    直接找"黑椭圆"不靠谱，两个坑都踩过：
@@ -2090,29 +2091,52 @@ def _hole_power_in(rgb: np.ndarray, box: tuple[int, int, int, int]) -> dict | No
     #    ±2px）。最后再用附近的小黑块（有就用）微调一下。
     flags = label_components((H >= 300.0) & (H <= 348.0) & (S >= 0.50) & (V >= 0.70),
                              keep_pixels=True, min_area=100)
-    if not flags:
-        return None
-    fc = max(flags, key=lambda c: c.area)
-    zone = np.zeros(V.shape, dtype=bool)
-    yb0, yb1 = int(fc.y1) + 1, min(int(fc.y1) + 50, V.shape[0])
-    for xa, xb in ((fc.x0 - 10, fc.x0 + 8), (fc.x1 - 8, fc.x1 + 10)):
-        zone[yb0:yb1, max(int(xa), 0):min(int(xb), V.shape[1])] = True
-    py, px = np.nonzero(zone & (V >= 0.70) & (S <= 0.45))
-    hole_x = float(px.mean()) if len(px) >= 6 else float(fc.x0) - 2.0
-    hole = np.array([hole_x, float(fc.y1) + HOLE_DY])
-    refine = None                               # 附近的小黑块 = 黑椭圆，有就拿它微调
-    for c in label_components(V <= 0.45, keep_pixels=True, min_area=10):
-        if c.area > 900 or not (0.35 <= c.w / float(max(c.h, 1)) <= 3.0):
-            continue
-        if c.area < 0.30 * c.w * c.h:
-            continue
-        q = np.array([c.pixels[:, 0].mean(), c.pixels[:, 1].mean()])
-        if abs(float(q[0]) - hole_x) > 16 or abs(float(q[1]) - hole[1]) > 14:
-            continue
-        if refine is None or c.area > refine[0]:
-            refine = (c.area, q)
-    if refine is not None:
-        hole = refine[1]
+    if flags:
+        # ① 瞄准界面：有旗子 ⇒ 用旗杆的 x + 固定纵向偏移（见上面的注释）
+        fc = max(flags, key=lambda c: c.area)
+        zone = np.zeros(V.shape, dtype=bool)
+        yb0, yb1 = int(fc.y1) + 1, min(int(fc.y1) + 50, V.shape[0])
+        for xa, xb in ((fc.x0 - 10, fc.x0 + 8), (fc.x1 - 8, fc.x1 + 10)):
+            zone[yb0:yb1, max(int(xa), 0):min(int(xb), V.shape[1])] = True
+        py, px = np.nonzero(zone & (V >= 0.70) & (S <= 0.45))
+        hole_x = float(px.mean()) if len(px) >= 6 else float(fc.x0) - 2.0
+        hole = np.array([hole_x, float(fc.y1) + HOLE_DY])
+        refine = None                           # 附近的小黑块 = 黑椭圆，有就拿它微调
+        for c in label_components(V <= 0.45, keep_pixels=True, min_area=10):
+            if c.area > 900 or not (0.35 <= c.w / float(max(c.h, 1)) <= 3.0):
+                continue
+            if c.area < 0.30 * c.w * c.h:
+                continue
+            q = np.array([c.pixels[:, 0].mean(), c.pixels[:, 1].mean()])
+            if abs(float(q[0]) - hole_x) > 16 or abs(float(q[1]) - hole[1]) > 14:
+                continue
+            if refine is None or c.area > refine[0]:
+                refine = (c.area, q)
+        if refine is not None:
+            hole = refine[1]
+    else:
+        # ② 推杆界面：**旗子被拔掉了**，小地图上洞口只剩一个黑点（实测网游截图）。
+        #    这时瞄准线的远端就是洞口附近 ⇒ 在线远端 60px 内找"小而圆、够实心"的黑点。
+        best = None
+        for c in label_components(V <= 0.38, keep_pixels=True, min_area=15):
+            if c.area > 400:
+                continue
+            if not (0.55 <= c.w / float(max(c.h, 1)) <= 1.9):
+                continue                        # 黑点是圆的（细长的不是）
+            # 别卡实心度：实测推杆界面那颗黑点被瞄准线末端的黄点压掉一半，只剩个圈
+            # （bbox 16×16、只有 26px，实心度 0.10），卡 0.45 会直接判掉。
+            if c.area < 0.06 * c.w * c.h:
+                continue
+            q = np.array([c.pixels[:, 0].mean(), c.pixels[:, 1].mean()])
+            dist_far = float(np.hypot(*(q - far)))
+            if dist_far > 60.0:
+                continue
+            key = (dist_far, -c.area)
+            if best is None or key < best[0]:
+                best = (key, q)
+        if best is None:
+            return None
+        hole = best[1]
 
     # ⑤ 力度
     dist = float(np.hypot(*(hole - player)))
