@@ -171,7 +171,7 @@ def wind_arrow(theta: float) -> str:
     return ARROWS8[int((theta % 360.0) / 45.0 + 0.5) % 8]
 
 
-HOLD_BAD = 3          # 连续这么多帧没识别出来…
+HOLD_BAD = max(1, int(round(1.5 * O.FPS)))   # 连续 1.5 秒没识别出来…（按秒折算，别再写死帧数）
 HOLD_SEC = 2.5        # …且距上次成功超过这么多秒，才把提示刷到窗口。
                       # 两个条件都要满足：单帧失败一律按住（慢机器一帧 2~3 秒，只看时间会一失败就弹提示）
 
