@@ -56,7 +56,19 @@ def _safe_stdio() -> None:
 _safe_stdio()
 
 FPS = 2.0                          # 识别频率（次/秒）；越高越跟手、CPU 线性增加（每帧约 70ms）
-QUALITY = 100                      # OBS 抓图 JPEG 质量 —— 固定 100（实测 80→100 少 3/4 的偶发反向）
+QUALITY = 90                       # OBS 抓图 JPEG 质量（可用环境变量 NSSR_JPG_QUALITY 覆盖）
+# 取值依据（2026-10-15 实机实测，1920×1080 采集卡源）：
+#   q100 请求 395ms + 解码 22ms = 整拍 459ms，体积 1773KB
+#   q90  请求 124ms + 解码  9ms = 整拍 178ms，体积  418KB   ← 2.6 倍，体积 -76%
+#   识别部分三档完全一样（都是 43ms，质量只影响传输与解码）。
+#   精度：静态 20 帧 + 转视角 60 帧，q90 定位/校验 80/80、风速零错、φ 相对 q100 中位偏 2.3°、
+#   **0 次 180° 反向**；q95 反而丢了 1 帧。历史上 q80 曾统计出"反向多 3/4"，所以停在 90 不再往下。
+QUALITY_ENV = "NSSR_JPG_QUALITY"   # 想回退/再压：NSSR_JPG_QUALITY=100（或 80）启动即可
+try:
+    _q_env = int(os.environ.get(QUALITY_ENV, "").strip() or QUALITY)
+    QUALITY = max(50, min(100, _q_env))
+except ValueError:
+    pass                           # 环境变量写错了就按默认 90 走，别让程序起不来
 OBS_HOST = "127.0.0.1"             # OBS WebSocket 地址（端口/密码读 OBS 自己的配置）
 REQ_TIMEOUT = 5                    # 单次请求超时（秒）；只是兜底，别设太小（慢机器单次取帧可能要 2~3 秒）
 WIDTH, HEIGHT = 1920, 1080         # 抓图分辨率（相对先验定位 / 超采样都按这个标定）
