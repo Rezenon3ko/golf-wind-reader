@@ -131,6 +131,17 @@ LOCK_MIN_VOTES = max(2, _frames(0.5))   # 至少要有这么多拍读到同一�
 # 按"≥0.5 秒的一致证据"折算：2 次/秒 → 2 拍（跟以前一样）、4 次/秒 → 2 拍、6 次/秒 → 3 拍。
 # ↑ 天大的坑：锁定判据是"票数×平均置信度"，于是**只有一拍**也能锁。实测 10-14 那局：
 #   风盘还没出现时误抓的假风盘某一拍读成 1 m/s，3 秒后就把它锁死了，之后一直显示错误风速。
+# ---- 早锁：不等满 WIND_MEASURE_S，只要"票够多 + 跨度够 + 一边倒"就立刻锁 ----
+# 动机：4 次/秒下满窗口要等 3 秒（12 拍才收齐），而玩家从"摆好姿势"到出手常常不到 3 秒。
+# 但"多收几拍"本身买不到新信息（画面基本不动，多出来的样本主要在压噪声），所以真正的收益是
+# **早点定下来**：4 拍一致就锁 ≈ 1 秒，而不是硬等 3 秒。下面四条同时满足才早锁：
+LOCK_EARLY_VOTES = 4        # ① 至少 4 拍读到同一个值（比"1 拍就锁"的老 bug 严 4 倍）
+LOCK_EARLY_SPAN_S = 0.6     # ② 这 4 票得横跨 ≥0.6 秒（防"一瞬间 4 连帧"；高帧率下才起作用）
+LOCK_EARLY_CONF = 0.82      # ③ 平均置信度 ≥0.82
+# ↑ 定这个数是因为实测分两簇：正常读（1 位/2 位数）落在 0.83~0.99（3 张真机帧 0.97/0.91/0.83），
+#   而"勉强过线"的弱读（日志里带 `?` 的、走 best_effort 的）实测只有 0.61~0.72。
+#   取 0.82 正好把弱读挡在门外，又不至于让 0.83 那种正常 2 位数白等 3 秒。
+LOCK_EARLY_RATIO = 0.80     # ④ 第一名占前两名置信度之和 ≥0.80（两个值咬得紧就不早锁，等满窗口）
 MEASURE_GAP_S = 2.5                # 风盘消失超过这么久 → 这一轮测的票作废，下次出现重新测。
 WIND_UNLOCK_S = 30.0               # 风向盘消失超过这么久（时限，暂定）→ 判定进入下一洞 → 解锁重新测
 LOCK_BREAK_RUN = _frames(3.0)      # 锁定期间"独立读数连续 3 秒落在另一档" → 认为换洞了（安全网）
@@ -474,6 +485,7 @@ class Recognizer:
         # ---- 风速锁定（同一洞风速固定）----
         self.locked: float | None = None  # 锁定的风速；None = 未锁（正在测）
         self.votes: dict[int, list] = {}               # 本轮测量：读数 -> [出现次数, 置信度之和]
+        self.vote_span: dict[int, list] = {}            # 读数 -> [第一次、最近一次读到它的时刻]（早锁用）
         self.measure_t0: float | None = None           # 本轮测量的起点（第一次看到风向盘的时刻）
         self.dial_t: float | None = None               # 上一次看到风向盘的时刻（用来算"消失多久"）
         self.break_run = 0                             # 独立读数落在"另一档"的连续拍数（安全网）
@@ -520,6 +532,9 @@ class Recognizer:
 
         怎么锁：看到风向盘后先**正常测 WIND_MEASURE_S 秒**，把这几秒里的读数按**值**归并，
         取"置信度之和"最高的那个值锁住 —— 也就是 票数 × 平均置信度。
+        另外还有一条**早锁**：满窗口之前，只要"票够多（4 拍）+ 跨度够（0.6s）+ 一边倒
+        （平均置信度 ≥0.85、占前两名 ≥0.80）"就立刻锁 —— 4 次/秒下约 1 秒就定，而不是干等 3 秒
+        （见 LOCK_EARLY_* 与 _early_lock_ok）。
 
         为什么不是"单拍置信度最高"：单拍高分可能正好是误读。按"和"排就好：读得又多又像的
         那个值赢。
@@ -537,23 +552,30 @@ class Recognizer:
                 self.measure_t0 = now                 # 第一次看到风盘 → 本轮测量开始
             if fr.speed is not None:                  # 没读出数字的这一拍不进票（只有区间）
                 conf = float((fr.ocr or {}).get("conf") or 0.0)
-                slot = self.votes.setdefault(int(round(fr.speed)), [0, 0.0])
+                val = int(round(fr.speed))
+                slot = self.votes.setdefault(val, [0, 0.0])
                 slot[0] += 1
                 slot[1] += conf
+                span = self.vote_span.setdefault(val, [now, now])   # 早锁要判"这批票横跨多久"
+                span[1] = now
             if self._choice is not None:              # 玩家在悬浮窗上点了一个 → 直接照它锁
                 self.locked, self.break_run = float(self._choice), 0
                 self.lock_event = f"风速按玩家的选择锁定 {self.locked:g} m/s"
                 self._clear_choice()
                 return
-            if self.votes and now - self.measure_t0 >= WIND_MEASURE_S:
+            if self.votes:
                 ranked = sorted(self.votes.items(), key=lambda kv: (-kv[1][1], -kv[1][0]))
                 v, (n, s) = ranked[0]
                 if n < LOCK_MIN_VOTES:
                     # 只有孤零零一拍读到它 → 先不锁，继续收票（真在瞄准界面的话下一拍就来第二票）。
                     # 单拍读错是最常见的"锁错风速"，而锁错之后整洞都在显示错值，代价太大。
                     return
-                if self._too_close_to_call(ranked):
+                full = now - self.measure_t0 >= WIND_MEASURE_S
+                if not full and not self._early_lock_ok(ranked, now):
+                    return                            # 还没满窗口、也不够一边倒 → 继续收票
+                if full and self._too_close_to_call(ranked):
                     # 拿不准 → 先把备选弹给玩家，等他点；期间继续收票（也继续显示）
+                    # （只有"满窗口"才需要问人：早锁那条本来就要求一边倒）
                     if self.choice_options is None:
                         self.choice_options = [[int(k), round(c[1] / max(c[0], 1), 2), int(c[0])]
                                                for k, c in ranked[:CHOICE_MAX]]
@@ -570,9 +592,16 @@ class Recognizer:
                                    for k, c in sorted(self.votes.items(),
                                                       key=lambda kv: -kv[1][1]) if k != v)
                 if not self.lock_event:
-                    self.lock_event = (f"风速锁定 {v} m/s（前 {WIND_MEASURE_S:g}s 里 "
-                                       f"{n} 拍读到它、置信度和 {s:.2f} 最高"
-                                       + (f"；其它 {losers}" if losers else "") + "）")
+                    if full:
+                        self.lock_event = (f"风速锁定 {v} m/s（前 {WIND_MEASURE_S:g}s 里 "
+                                           f"{n} 拍读到它、置信度和 {s:.2f} 最高"
+                                           + (f"；其它 {losers}" if losers else "") + "）")
+                    else:
+                        sp = self.vote_span.get(v, [now, now])
+                        self.lock_event = (f"风速早锁 {v} m/s（{n} 拍一致、跨度 "
+                                           f"{sp[1] - sp[0]:.1f}s、平均置信度 {s / max(n, 1):.2f}、"
+                                           f"占前两名 {s / max(s + (ranked[1][1][1] if len(ranked) > 1 else 0.0), 1e-9):.2f}"
+                                           + (f"；其它 {losers}" if losers else "") + "）")
             elif fr.speed_range and now - (self.measure_t0 or now) >= WIND_MEASURE_S:
                 # 数字**一直读不出**、但箭头颜色认得出（风速只给了个区间）——以前这条路锁永远锁不上，
                 # 区间会一直挂着。现在把这一档的数字全列出来让玩家点一个（6-10 就列 6 7 8 9 10）。
@@ -606,6 +635,28 @@ class Recognizer:
                 self._unlock()
         else:
             self.break_run = 0                        # 同档、或这拍没读出来 → 清零
+
+    def _early_lock_ok(self, ranked: list, now: float) -> bool:
+        """
+        够不够"早锁"（不等满 WIND_MEASURE_S 就定下来）—— 四条同时满足：
+          ① 第一名 ≥ LOCK_EARLY_VOTES 拍（4 拍，比"1 拍就锁"的老 bug 严得多）
+          ② 这 4 票横跨 ≥ LOCK_EARLY_SPAN_S（0.6s；帧率越高越重要，防止一瞬间连出 4 帧）
+          ③ 平均置信度 ≥ LOCK_EARLY_CONF（0.85）—— 弱读（best_effort，带 ? 的）自然被挡住
+          ④ 第一名占前两名置信度之和 ≥ LOCK_EARLY_RATIO（0.80）—— 咬得紧就等满窗口再问玩家
+        为什么敢比满窗口那条更早定：画面在瞄准界面里基本不动，"多等 2 秒"买不到新信息
+        （多出来的样本主要在压噪声）；而**系统性**读错（例如 15 被截成 1）不靠票数防，
+        靠箭头颜色档交叉校验 + match_glyphs 的截断保护防。所以 4 拍一致 + 高置信度足够。
+        """
+        (v, (n, s)) = ranked[0]
+        if n < LOCK_EARLY_VOTES:
+            return False
+        span = self.vote_span.get(v)
+        if not span or span[1] - span[0] < LOCK_EARLY_SPAN_S:
+            return False
+        if s / max(n, 1) < LOCK_EARLY_CONF:
+            return False
+        second = ranked[1][1][1] if len(ranked) > 1 else 0.0
+        return s / max(s + second, 1e-9) >= LOCK_EARLY_RATIO
 
     @staticmethod
     def _too_close_to_call(ranked: list) -> bool:
@@ -641,6 +692,7 @@ class Recognizer:
         """解锁：回到"重新测量"状态，等风向盘下次出现再锁一次。"""
         self.locked = None
         self.votes = {}
+        self.vote_span = {}
         self.measure_t0 = None
         self.break_run = 0
         self.lock_mismatch = ""
@@ -664,7 +716,7 @@ class Recognizer:
             # 这一轮测量被打断了（挥杆 / 走位 / 切界面）→ 票作废、重新开始量。
             # 不清的话，"6 秒前孤零零一拍读错的 1 m/s"会跟回来后新看到的帧拼在一起，
             # 凑够票数被锁死（实测就是这么锁错整洞的）。
-            self.votes, self.measure_t0 = {}, None
+            self.votes, self.vote_span, self.measure_t0 = {}, {}, None
             self._clear_choice()
         if gone <= WIND_UNLOCK_S:
             return
