@@ -146,6 +146,8 @@ BTN_BG = "#232833"     # 备选按钮的底色：比窗口底色浅一档，不�
 PICK_BTN_PADX = 7      # 按钮左右内边距（1 位数一个键帽别太宽）
 PICK_BTN_PADY = 2
 PICK_PAD = 8
+PICK_PER_ROW = 5       # 一行最多几个键帽 —— 正好等于一个颜色档（青 1-5 / 黄 6-10 / 品红 11-15），
+                       # "全风档候选"展开成 15 个时就是 3 行，颜色一圈对应游戏里的箭头颜色
 PAD = 0                        # 左右留白；0 = 窗口宽度就是第一行的宽度（第二行字小，顶不出窗口）
 # 风向箭头：按真实夹角 θ（0=正前，顺时针）取 8 向
 ARROWS8 = "↑↗→↘↓↙←↖"
@@ -944,20 +946,34 @@ class Overlay:
         if key != self._pick_key:
             # 备选或标题变了 → 重建按钮（同一组备选就不重建，免得按钮在手指底下闪）
             pfont = self._font_at(max(10, int(round(PICK_SIZE * self.scale))))
-            self._pick_title.config(text=f"{hint or '风速拿不准'}，选一个：", font=pfont)
+            head = hint or "风速拿不准"
+            # 提示本身就是一句问句/带冒号时别再叠"选一个"，免得变成"…选哪个？，选一个："
+            if not head.endswith(("？", "?", "：")):
+                head += "，选一个："
+            self._pick_title.config(text=head, font=pfont)
             for w in self._pick_btns:
                 w.destroy()
-            self._pick_btns = []
-            for v, conf, n in opts:
+            for r in self._pick_rows:
+                r.destroy()
+            self._pick_btns, self._pick_rows = [], []
+            row = None
+            for i, (v, conf, n) in enumerate(opts):
+                if i % PICK_PER_ROW == 0:             # 5 个一行；15 个"全风档候选"正好 3 行
+                    row = tk.Frame(self.pick, bg=BG)
+                    row.pack(pady=(0, 3))
+                    self._pick_rows.append(row)
                 # 用 Label + relief 画"键帽"，不用 Button：窗口是 -alpha 半透明的，扁平按钮
                 # （bg 只比窗口底色深一点点）叠在游戏上几乎看不见，玩家都不知道能点。
                 # Label 的 bd/relief 在 Windows/macOS 上都老实按配置画，边框能保证看得见。
-                b = tk.Label(self._pick_row, text=str(int(v)), font=pfont,
-                             bg=BTN_BG, fg=FG, bd=1, relief="solid",
+                # 数字颜色跟着风速档位走（青 1-5 / 黄 6-10 / 品红 11-15）—— 展开成 15 个时
+                # 一眼就能跟游戏里箭头的颜色对上。
+                fg = speed_color(v) or FG
+                b = tk.Label(row, text=str(int(v)), font=pfont,
+                             bg=BTN_BG, fg=fg, bd=1, relief="solid",
                              padx=PICK_BTN_PADX, pady=PICK_BTN_PADY, cursor="hand2")
                 b.bind("<Button-1>", lambda e, v=v: self._choose(v))
                 b.bind("<Enter>", lambda e, w=b: w.config(bg=ACCENT, fg=BG))
-                b.bind("<Leave>", lambda e, w=b: w.config(bg=BTN_BG, fg=FG))
+                b.bind("<Leave>", lambda e, w=b, c=fg: w.config(bg=BTN_BG, fg=c))
                 b.pack(side="left", padx=(0, 6))
                 self._pick_btns.append(b)
             self._pick_key = key
@@ -982,8 +998,7 @@ class Overlay:
         self._pick_title = tk.Label(p, text="风速拿不准，选一个：", font=self._font_at(PICK_SIZE),
                                     bg=BG, fg=WARN)
         self._pick_title.pack(pady=(PICK_PAD, 4))
-        self._pick_row = tk.Frame(p, bg=BG)
-        self._pick_row.pack(pady=(0, PICK_PAD))
+        self._pick_rows: list = []                    # 每 PICK_PER_ROW 个键帽一行（见 _choice_popup）
         self._pick_btns: list = []
         self.pick = p
         p.withdraw()

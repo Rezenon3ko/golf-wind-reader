@@ -153,7 +153,13 @@ LOCK_BREAK_RUN = _frames(3.0)      # 锁定期间"独立读数连续 3 秒落在
 CHOICE_CONF = 0.80                 # 平均置信度下限（正常帧 0.87~1.00，根本不会触发）
 CHOICE_RATIO = 0.65                # 第一名在"前两名总票"里的占比下限
 CHOICE_MAX = 5                     # 最多给几个备选（一排按钮放得下；"数字读不出"那档正好 5 个）
-CHOICE_TIMEOUT_S = 20.0            # 玩家一直不点 → 按最高分自动锁，别一直挂着
+CHOICE_TIMEOUT_S = 5.0             # 备选弹出 5 秒还没人点 → 不再自己猜：换成"全风档候选"（1~15）
+# ↑ 原来是"20 秒没人点就按最高分自动锁"。按"风速绝不能错、拿不准就让玩家选"的原则改成：
+#   5 秒后把全部 15 个可能值（按青/黄/品红三档分行）都列出来，由玩家点一个 —— 程序不替玩家
+#   拍板。玩家点了就锁，不点就一直挂着（换洞/风盘消失会自然收起）。
+# ---- 锁定值与独立读数持续打架时的判据（同色档内部也算，见 _update_lock 的已锁分支）----
+LOCK_VALUE_RUN = _frames(3.0)      # 连续 3 秒读到"另一个值"（同档也算）→ 弹候选让玩家裁决
+LOCK_VALUE_CONF = 0.82             # 只认高置信度的独立读数当证据（正常读 0.83~0.99、弱读 0.61~0.72）
 FLIP_CONF = 0.6                    # 方向置信度低于此值时才做反 180° 保护
 FLIP_RUN = _frames(1.5)            # 连续 1.5 秒都反向才认为真的转向了（原 2 次/秒 × 3 拍）
 SMOOTH_A = 1.0 - (1.0 - 0.25) ** (2.0 / FPS)
@@ -486,9 +492,12 @@ class Recognizer:
         self.locked: float | None = None  # 锁定的风速；None = 未锁（正在测）
         self.votes: dict[int, list] = {}               # 本轮测量：读数 -> [出现次数, 置信度之和]
         self.vote_span: dict[int, list] = {}            # 读数 -> [第一次、最近一次读到它的时刻]（早锁用）
+        self.vote_band_ok: dict[int, int] = {}          # 读数 -> "这一拍箭头颜色档认得出"的票数
         self.measure_t0: float | None = None           # 本轮测量的起点（第一次看到风向盘的时刻）
         self.dial_t: float | None = None               # 上一次看到风向盘的时刻（用来算"消失多久"）
         self.break_run = 0                             # 独立读数落在"另一档"的连续拍数（安全网）
+        self.value_run = 0                             # 独立读数落在"同一档但另一个值"的连续拍数
+        self.value_seen: int | None = None             # 那个"另一个值"（弹候选用）
         self.lock_event = ""                           # 状态切换时留一句话，交给日志（每帧清空）
         self.lock_mismatch = ""                        # 锁定值与这一拍独立读数打架时的说明（每帧清空）
         self._choice: int | None = None                # 玩家点的备选风速（UI 线程写、识别线程读）
@@ -496,6 +505,7 @@ class Recognizer:
         self.choice_hint = ""                          # 弹窗标题里的那句（"风速拿不准" / "数字没读出"）
         self.ask_since: float | None = None            # 备选弹出来的时刻（超时自动锁用）
         self.band_asked = False                        # "数字读不出"那组备选已经问过且被晾着 → 别再弹
+        self.choice_all = False                        # 弹窗是否已从"前几名"展开成"全风档候选"
         self.ocr = W.OcrState()          # 字形模板库状态独立
         n = W.load_glyph_bank(GLYPH_BANK, state=self.ocr)
         if not n:
@@ -547,6 +557,14 @@ class Recognizer:
           · 箭头是"通用掩膜"量的（量不出颜色）时，才退回用数字推出来的档。
         """
         now = time.time()
+        if self._choice is not None:
+            # 玩家刚点了备选（可能是"拿不准"、也可能是"锁定值与读数打架"那张弹窗）——
+            # 一律照玩家的选择锁，并把弹窗收掉。放在最前面，锁定状态下也认。
+            self.locked, self.break_run, self.value_run = float(self._choice), 0, 0
+            self.value_seen = None
+            self.lock_event = f"风速按玩家的选择锁定 {self.locked:g} m/s"
+            self._clear_choice()
+            return
         if self.locked is None:
             if self.measure_t0 is None:
                 self.measure_t0 = now                 # 第一次看到风盘 → 本轮测量开始
@@ -558,11 +576,8 @@ class Recognizer:
                 slot[1] += conf
                 span = self.vote_span.setdefault(val, [now, now])   # 早锁要判"这批票横跨多久"
                 span[1] = now
-            if self._choice is not None:              # 玩家在悬浮窗上点了一个 → 直接照它锁
-                self.locked, self.break_run = float(self._choice), 0
-                self.lock_event = f"风速按玩家的选择锁定 {self.locked:g} m/s"
-                self._clear_choice()
-                return
+                if fr.arrow_band is not None:         # 这一拍箭头颜色档认得出 → 记一票"有档"
+                    self.vote_band_ok[val] = self.vote_band_ok.get(val, 0) + 1
             if self.votes:
                 ranked = sorted(self.votes.items(), key=lambda kv: (-kv[1][1], -kv[1][0]))
                 v, (n, s) = ranked[0]
@@ -573,19 +588,23 @@ class Recognizer:
                 full = now - self.measure_t0 >= WIND_MEASURE_S
                 if not full and not self._early_lock_ok(ranked, now):
                     return                            # 还没满窗口、也不够一边倒 → 继续收票
-                if full and self._too_close_to_call(ranked):
-                    # 拿不准 → 先把备选弹给玩家，等他点；期间继续收票（也继续显示）
-                    # （只有"满窗口"才需要问人：早锁那条本来就要求一边倒）
+                if full and (self._too_close_to_call(ranked)
+                             or self.vote_band_ok.get(v, 0) * 2 < n):
+                    # 拿不准 → 把备选弹给玩家，等他点；期间继续收票（也继续显示）。
+                    # 两条触发条件：
+                    #   · 前两名咬得紧（_too_close_to_call）；
+                    #   · 这个值的票**过半都没认出箭头颜色档** —— 数字失去了"颜色档交叉校验"
+                    #     这个独立证据，等于裸读，按"绝不能错、拿不准让玩家选"一律不自动锁。
+                    #     （实测日志里确实有 `掩膜=通用掩膜` 的帧。）
+                    # 只有"满窗口"才问人：早锁那条本来就要求一边倒 + 票都有颜色档（见 _early_lock_ok）。
                     if self.choice_options is None:
                         self.choice_options = [[int(k), round(c[1] / max(c[0], 1), 2), int(c[0])]
                                                for k, c in ranked[:CHOICE_MAX]]
                         self.ask_since = now
-                        self.choice_hint = "风速拿不准"
-                    if now - (self.ask_since or now) < CHOICE_TIMEOUT_S:
-                        return
-                    # 一直没人点 → 按最高分自动锁（并在日志里说清是超时自动定的）
-                    self.lock_event = (f"等玩家选风速超时（{CHOICE_TIMEOUT_S:g}s）→ "
-                                       f"按最高分自动锁定 {v} m/s")
+                        self.choice_hint = ("风速拿不准" if self._too_close_to_call(ranked)
+                                            else "箭头颜色档认不出，风速请确认")
+                    self._expand_choice_if_timeout(now)
+                    return                                # 玩家没点 → 不锁，继续显示待确认状态
                 self.locked, self.break_run = float(v), 0
                 self._clear_choice()
                 losers = "、".join(f"{k}({c[0]}拍/Σ{c[1]:.2f})"
@@ -611,10 +630,9 @@ class Recognizer:
                     self.ask_since = now
                     self.choice_hint = f"数字没读出（{W.band_name(fr.arrow_band)}档）"
                 if self.choice_options is not None:
-                    if now - (self.ask_since or now) < CHOICE_TIMEOUT_S:
-                        return
-                    self.band_asked = True            # 超时=玩家不答，别再反复弹同一组
-                    self._clear_choice()
+                    # 5 秒没人点 → 不再"猜一档就收摊"，改成把全部 15 个可能值列出来（按三档分行），
+                    # 由玩家点一个 —— 区间本身也只是一个估计，玩家可能知道真实风速。
+                    self._expand_choice_if_timeout(now)
             return
         # ---- 已锁定：这一拍的独立读数只当安全网 ----
         band_lock = W.wind_color(self.locked)
@@ -635,6 +653,39 @@ class Recognizer:
                 self._unlock()
         else:
             self.break_run = 0                        # 同档、或这拍没读出来 → 清零
+            # 同档但**值**一直不一样（例如锁了 7、之后稳定读到 8）：跨档那条安全网永远不触发，
+            # 显示会一直停在旧值（实测 40 拍都不动）。按"绝不能错、拿不准让玩家选"的原则：
+            # 不自己改、也不硬扛 —— 连续 3 秒读到另一个**高置信度**的值就弹候选让玩家裁决。
+            if (fr.arrow_band is not None and fr.speed is not None
+                    and abs(fr.speed - self.locked) > 1e-9
+                    and float((fr.ocr or {}).get("conf") or 0.0) >= LOCK_VALUE_CONF):
+                self.value_run += 1
+                self.value_seen = int(round(fr.speed))
+                self.lock_mismatch = (f"锁定 {self.locked:g} m/s，但连续 {self.value_run} 拍"
+                                      f"独立读到 {self.value_seen} m/s（同档）")
+                if self.value_run >= LOCK_VALUE_RUN and self.choice_options is None:
+                    self.choice_options = [[int(self.locked), 0.0, 0], [self.value_seen, 0.0, 0]]
+                    self.ask_since = now
+                    self.choice_hint = (f"锁定 {self.locked:g}，读数一直 "
+                                        f"{self.value_seen} —— 选哪个？")
+            else:
+                self.value_run, self.value_seen = 0, None
+
+    def _expand_choice_if_timeout(self, now: float) -> None:
+        """
+        备选弹窗挂了 CHOICE_TIMEOUT_S 秒还没人点 → 不再自己猜，换成"全风档候选"：
+        把 1~15 全部列出来（悬浮窗那边按青/黄/品红三档分三行、颜色跟着档位），玩家点一个即可。
+
+        为什么要这样：原先是"超时按最高分自动锁"，但"拿不准"本身说明证据不足 ——
+        按"风速绝不能错"的原则，宁可由玩家点，也不替玩家拍板。
+        """
+        if self.choice_options is None or self.choice_all:
+            return
+        if now - (self.ask_since or now) < CHOICE_TIMEOUT_S:
+            return
+        self.choice_options = [[v, 0.0, 0] for v in range(1, W.MAX_WIND + 1)]
+        self.choice_all = True
+        self.choice_hint = "拿不准，全部档位都列出来了"
 
     def _early_lock_ok(self, ranked: list, now: float) -> bool:
         """
@@ -649,6 +700,10 @@ class Recognizer:
         """
         (v, (n, s)) = ranked[0]
         if n < LOCK_EARLY_VOTES:
+            return False
+        if self.vote_band_ok.get(v, 0) < LOCK_EARLY_VOTES:
+            # ⑤ 这 4 票必须**每一拍都认出了箭头颜色档** —— 没有颜色档交叉校验的裸读
+            #    不许早锁（否则一旦采集链把颜色洗坏，就没人能拦住一个错误数字）。
             return False
         span = self.vote_span.get(v)
         if not span or span[1] - span[0] < LOCK_EARLY_SPAN_S:
@@ -687,14 +742,18 @@ class Recognizer:
         self.choice_options = None
         self.choice_hint = ""
         self.ask_since = None
+        self.choice_all = False            # "全风档候选"是否已经展开（同一个弹窗只展开一次）
 
     def _unlock(self) -> None:
         """解锁：回到"重新测量"状态，等风向盘下次出现再锁一次。"""
         self.locked = None
         self.votes = {}
         self.vote_span = {}
+        self.vote_band_ok = {}
         self.measure_t0 = None
         self.break_run = 0
+        self.value_run = 0
+        self.value_seen = None
         self.lock_mismatch = ""
         self.band_asked = False
         self._clear_choice()
@@ -716,7 +775,8 @@ class Recognizer:
             # 这一轮测量被打断了（挥杆 / 走位 / 切界面）→ 票作废、重新开始量。
             # 不清的话，"6 秒前孤零零一拍读错的 1 m/s"会跟回来后新看到的帧拼在一起，
             # 凑够票数被锁死（实测就是这么锁错整洞的）。
-            self.votes, self.vote_span, self.measure_t0 = {}, {}, None
+            self.votes, self.vote_span, self.vote_band_ok, self.measure_t0 = {}, {}, {}, None
+            self.value_run, self.value_seen = 0, None
             self._clear_choice()
         if gone <= WIND_UNLOCK_S:
             return
@@ -829,7 +889,9 @@ class Recognizer:
                 "speed_locked": self.locked is not None, "lock_event": self.lock_event,
                 "lock_mismatch": self.lock_mismatch,
                 "arrow_band": fr.arrow_band,
-                "need_choice": bool(self.choice_options) and self.locked is None,
+                # 只要有待确认的备选就弹 —— 锁定时也会弹（"锁定值与读数一直打架"那种情况），
+                # 所以别再拿 locked is None 来挡。
+                "need_choice": bool(self.choice_options),
                 "choice_options": self.choice_options or [],
                 "choice_hint": self.choice_hint,
                 "latency_ms": (time.time() - t0) * 1000.0}
