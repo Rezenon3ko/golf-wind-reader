@@ -90,7 +90,9 @@ try:
 except ValueError:
     pass                           # 环境变量写错了就按默认 90 走，别让程序起不来
 OBS_HOST = "127.0.0.1"             # OBS WebSocket 地址（端口/密码读 OBS 自己的配置）
-REQ_TIMEOUT = 5                    # 单次请求超时（秒）；只是兜底，别设太小（慢机器单次取帧可能要 2~3 秒）
+REQ_TIMEOUT = 3                    # 单次请求超时（秒）—— 只影响"一次取帧最多等多久"，不是重连间隔。
+# ↑ 5 → 3（2026-10-15）：OBS 卡住时，"3 次连续失败 → 重连"的判定从 ~15.6s 缩到 ~9.6s。
+#   余量仍然很大：实测同机 q90 取帧 108~133ms、q100 也才 383~405ms（7~25 倍余量）。
 WIDTH, HEIGHT = 1920, 1080         # 抓图分辨率（相对先验定位 / 超采样都按这个标定）
 
 # 采集卡类输入源的 inputKind（OBS 的类型标识，与界面语言无关）
@@ -437,6 +439,10 @@ class ObsWebSocketSource:
             return None
         t_dec = time.time() - t1
         self.last_timing = (t_req, t_dec)      # 诊断用（--verbose 写进日志）
+        # 这一拍成功了 → 失败计数归零。**必须清零**：RECONNECT_FAILS 的语义是"**连续**失败"，
+        # 以前只在建连时清过，于是"一局里零散失败 3 次"（中间隔着几十分钟正常识别）也会被判死重连，
+        # 表现就是莫名其妙卡一下、风速重测。
+        self.fails = 0
         return arr
 
     def _fail(self, why: str) -> None:
