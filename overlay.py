@@ -165,7 +165,9 @@ def speed_color(speed: float) -> str:
 
 
 def wind_arrow(theta: float) -> str:
-    """真实夹角 θ → 8 向箭头（箭头指向 = 风吹去的方向）"""
+    """真实夹角 θ → 8 向箭头（箭头指向 = 风吹去的方向）；θ 缺失时给个中性点。"""
+    if theta is None:
+        return "·"
     return ARROWS8[int((theta % 360.0) / 45.0 + 0.5) % 8]
 
 
@@ -193,6 +195,7 @@ GAP = 10                       # 同一行里两项之间的间距（两行共�
 # 整窗缩放（长宽比固定）：字号、间距、输入框宽度一起按同一比例走，所以比例不会变
 MIN_SCALE = 0.5
 MAX_SCALE = 4.0
+ALPHA_MIN = 0.05       # --alpha 的下限（0 会得到一个"看不见但吃鼠标"的窗口，见 _alpha_arg）
 SCALE_STEP = 1.1               # 滚轮/菜单每次缩放比例
 # 风速锁定的标记（跟在风速后面，如 `↑  7 m/s ◆`）。换符号只改这一个字符串。
 # 注意：**不能用 🔒 这类 emoji** —— 它们是非 BMP 字符（U+1F512），Windows 的
@@ -500,9 +503,12 @@ class Reader(threading.Thread):
     @staticmethod
     def _prune_dumps() -> None:
         """
-        诊断图总量超过 DUMP_BUDGET 就按时间删旧的（顺手清掉旧版本留下的 .png）。
+        诊断图总量超过 DUMP_BUDGET 就按时间删旧的。
 
-        这样"日志 ≤2MB + 诊断图 ≤2MB"，整个程序在磁盘上最多 5MB 以内。
+        只认**自己**存下来的那批（文件名前缀 `nssr-fail-`）：玩家丢在这个目录里的截图、
+        别的程序放的文件一律不碰（实测过：放一张别人的 png 进去，清理完仍然在）。
+
+        于是"日志 ≤1MB（512KB 当前 + 512KB 上一轮）+ 诊断图 ≤2MB"，总共 3MB 出头。
         """
         d = _artifact_dir()
         try:
@@ -546,7 +552,8 @@ class Overlay:
         self.root.overrideredirect(True)              # 无边框
         self.root.attributes("-topmost", True)        # 置顶
         try:
-            self.root.attributes("-alpha", args.alpha)  # 半透明
+            # 再夹一次：命令行已经校验过，这里是防"从别处直接构造 Overlay"时传进来越界值
+            self.root.attributes("-alpha", max(ALPHA_MIN, min(1.0, float(args.alpha))))
         except Exception:
             pass
         self.root.configure(bg=BG)
@@ -879,7 +886,7 @@ class Overlay:
             # 大行：风向箭头 + 总风速 + 夹角（夹角中性色）
             # 小行：横向 / 纵向分量
             # 数字部分统一用当前风速档位的颜色
-            ang = w.get("theta_signed_deg", w["theta_deg"])
+            ang = w.get("theta_signed_deg") or w.get("theta_deg")
             # 低置信度的显示语义（数字识别不确定时怎么显示）：
             #   "7? m/s"           数字读出来了，但只是勉强过线 → 带问号提醒这拍存疑
             #   "6-10 m/s"         只认出箭头的颜色档、数字没读出 → 给区间，方向照样显示
@@ -899,7 +906,8 @@ class Overlay:
                 col = speed_color(sp)
             self.l_wind.config(text=f"{wind_arrow(w['theta_deg'])}  {sp_txt}",
                                fg=col, font=self.font)
-            self.l_ang.config(text=f"{ang:+.1f}°", font=self.font)
+            # 夹角缺失（这一拍没量到方向）显示成 —，别让整帧渲染抛异常
+            self.l_ang.config(text=("—" if ang is None else f"{ang:+.1f}°"), font=self.font)
             if "lateral_abs" in w:
                 # 第二行沿用第一行的排法：箭头 + 两个空格 + 数值
                 # 颜色各自按**自己的数值**取档位（横向 7 → 黄、纵向 12 → 品红），不是跟着总风速
@@ -1223,9 +1231,29 @@ class Overlay:
 # --------------------------------------------------------------------------
 # 命令行
 # --------------------------------------------------------------------------
+def _alpha_arg(v: str) -> float:
+    """
+    --alpha 的解析+范围校验。
+
+    以前不校验：`--alpha 3` 被 Tk 抛错后 **静默** 失效（窗口照常不透明，用户以为没生效），
+    `--alpha 0` 更坑 —— 窗口全透明但还占着那块地方吃鼠标，看着像程序卡死。
+    所以下限取 0.05（几乎看不见但还看得见），越界直接报错说清楚。
+    """
+    try:
+        a = float(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"透明度得是数字：{v!r}")
+    if not (ALPHA_MIN <= a <= 1.0):
+        raise argparse.ArgumentTypeError(
+            f"透明度要在 {ALPHA_MIN}~1 之间（默认 0.5）；给 {a:g} 的话窗口要么全透明看不见、"
+            f"要么 Tk 直接报错")
+    return a
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="NSS 高尔夫风向 —— 桌面悬浮窗")
-    p.add_argument("--alpha", type=float, default=0.5, help="窗口不透明度 0~1，默认 0.5")
+    p.add_argument("--alpha", type=_alpha_arg, default=0.5,
+                   help=f"窗口不透明度 {ALPHA_MIN}~1，默认 0.5")
     return p
 
 

@@ -614,6 +614,9 @@ GAUGE_ZONE_TOL_Y = 0.10
 # 白环覆盖下限 —— 真风盘那圈白环是闭合的（实测 3 帧都 1.00），过场/走位/球在飞时
 # 同一个位置上就是天空/树/草地（实测 0.00）。
 GAUGE_RING_MIN = 0.75
+# 画面根本不像游戏画面时的早退门槛（见 _mask_fragmented）：白/青掩膜的"横向跳变密度"
+# 上限。真机瞄准帧实测 0.001~0.013，雪花/静态噪声 0.13~0.50，差一个数量级。
+MASK_EDGE_DENSITY_MAX = 0.05
 
 @dataclass
 class Dial:
@@ -1054,6 +1057,23 @@ def gauge_verified(rgb: np.ndarray, dial: Dial, verbose: bool = False) -> bool:
     return True
 
 
+def _mask_fragmented(*masks: np.ndarray) -> bool:
+    """
+    掩膜碎到什么程度算"这帧不是游戏画面"：数**横向跳变密度**（0↔1 跳变次数 / 像素数）。
+
+    真机瞄准帧的白/青掩膜都是成片的大块（实测 3 帧 0.001~0.013），雪花/静态噪声是逐像素
+    乱跳（实测 0.13~0.50）—— 差一个数量级，所以 0.05 这条线两头都留了很大余量。
+    只看横向跳变就够（一次向量化比较，1080p ~1ms、4K ~5ms），纵向再数一遍没必要。
+    """
+    for m in masks:
+        if m.size == 0 or m.shape[1] < 2:
+            continue
+        edges = int((m[:, 1:] != m[:, :-1]).sum())
+        if edges / float(m.shape[0] * (m.shape[1] - 1)) > MASK_EDGE_DENSITY_MAX:
+            return True
+    return False
+
+
 def find_dials(rgb: np.ndarray, hsv: np.ndarray | None = None,
                verbose: bool = False, side: str | None = None) -> list[Dial]:
     """
@@ -1070,6 +1090,14 @@ def find_dials(rgb: np.ndarray, hsv: np.ndarray | None = None,
     img_h, img_w = rgb.shape[:2]
     white = (V > WHITE_V) & (S < WHITE_S)
     cyan = arrow_mask(hsv)
+    # 先花几毫秒判一下"这帧像不像游戏画面"：雪花/静态噪声的掩膜是逐像素乱跳的，
+    # 而下面那几条后路（白环扫描 + 圆盘拟合 + 箭头锚点）都要对整帧跑并查集，实测
+    # 1080p 噪声帧 2.8s、4K 噪声 5.7s —— 窗口会卡住好几秒。真机帧的跳变密度只有
+    # 它的百分之几（见 _mask_fragmented），所以这条闸门对正常帧零影响。
+    if _mask_fragmented(white, cyan):
+        if verbose:
+            print("[跳过] 掩膜过于碎片化（这帧不像游戏画面）→ 不做整帧搜索")
+        return []
     dials: list[Dial] = []
     grass = None                        # 草地掩膜：只在首次需要时整帧算一次（通常 0~2 次）
     comps = label_components(white, keep_pixels=True, min_area=30)
@@ -2023,13 +2051,23 @@ def true_to_apparent(theta: float, k: float) -> float:
     return math.degrees(math.atan2(math.sin(t), k * math.cos(t))) % 360.0
 
 
-def wind_metrics(speed: float | None, theta: float) -> dict:
+def wind_metrics(speed: float | None, theta: float | None) -> dict:
     """
     把风矢量按"正前方基准"做正交分解：
 
         横向 = 风速 × sin(夹角)   正 = 吹向右侧
         纵向 = 风速 × cos(夹角)   正 = 顺风
+
+    theta=None 表示"这一拍没量到方向"：不抛异常，照常返回一份把角度字段标成 None、
+    分量字段留空的结果 —— 调用方（窗口/终端）本来就是按"字段在不在"决定显示成 `—` 的，
+    签名跟 speed 一样允许 None 才对等（以前会直接 TypeError 把整帧炸掉）。
     """
+    if theta is None:
+        out: dict = dict(theta_deg=None, theta_signed_deg=None, side="—",
+                         compass="—", cos=None, sin=None, dir_unknown=True)
+        if speed is not None:
+            out["speed"] = speed
+        return out
     t = math.radians(theta)
     cos_v = math.cos(t)
     sin_v = math.sin(t)

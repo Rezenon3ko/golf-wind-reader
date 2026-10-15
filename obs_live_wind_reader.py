@@ -854,6 +854,11 @@ def _num(v, fmt: str = "g", dash: str = "—") -> str:
         return dash
 
 
+def _deg(v) -> str:
+    """角度：有值给 "351.6°"，没有就给一个 "—"（不留孤零零的度数符号）。"""
+    return "—" if v is None else f"{float(v):.1f}°"
+
+
 def line_for(st: dict) -> str:
     if st.get("no_wind"):
         return "风速 0 m/s —— 无风，跳过计算（等风速变化）"
@@ -865,10 +870,10 @@ def line_for(st: dict) -> str:
     rng = st.get("speed_range")
     if st.get("speed") is None and rng:
         return (f"风速 {rng[0]}-{rng[1]} m/s（数字未读出，按箭头颜色档显示）| "
-                f"夹角 {w['theta_deg']:.1f}° | 横向/纵向算不了")
+                f"夹角 {_deg(w.get('theta_deg'))} | 横向/纵向算不了")
     if "lateral_abs" not in w:                     # 风速没定就没有分量，别在这里 KeyError
-        return f"夹角 {w['theta_deg']:.1f}° | 横向/纵向算不了（风速未定）"
-    return (f"风 {_num(w.get('speed'))} m/s | 夹角 {w['theta_deg']:.1f}° | "
+        return f"夹角 {_deg(w.get('theta_deg'))} | 横向/纵向算不了（风速未定）"
+    return (f"风 {_num(w.get('speed'))} m/s | 夹角 {_deg(w.get('theta_deg'))} | "
             f"横向 {w['lateral_abs']:.2f} {w['lateral_dir']} | "
             f"纵向 {w['longitudinal_abs']:.2f} {w['longitudinal_dir']}")
 
@@ -906,8 +911,8 @@ def print_test_report(st: dict, rgb) -> None:
                 f"{v}{'' if strong else '~'}({s:.2f},{n or '无档'})"
                 for v, s, strong, n in st["cands"][:5]))
         print(f"画面夹角 φ  : {st['phi']:.1f}°   （俯视压缩 k={st['k']:.3f}）")
-        print(f"风向夹角 θ  : {w['theta_deg']:.1f}°  {w['compass']}"
-              f"   （cos={w['cos']:.4f}  sin={w['sin']:.4f}）")
+        print(f"风向夹角 θ  : {_deg(w.get('theta_deg'))}  {w.get('compass', '—')}"
+              f"   （cos={_num(w.get('cos'), '.4f')}  sin={_num(w.get('sin'), '.4f')}）")
         if "lateral_abs" in w:
             print(f"横向风速    : {w['lateral_abs']:.2f} m/s {w['lateral_dir']}")
             print(f"纵向风速    : {w['longitudinal_abs']:.2f} m/s {w['longitudinal_dir']}")
