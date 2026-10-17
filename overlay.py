@@ -5,7 +5,7 @@ NSS 高尔夫风向 —— 桌面悬浮窗（Tkinter）
 
 用一个置顶的小窗口显示识别结果，不用盯着命令行。
 
-    python3 overlay.py                    # 固定每秒识别 1 次
+    python3 overlay.py                    # 默认 4 次/秒（NSSR_FPS 可调）
     python3 overlay.py --alpha 0.5        # 更透明（默认 0.5）
 
 操作：**拖动窗口**移动；**右键 → 退出**。
@@ -818,15 +818,17 @@ class Overlay:
         self.l_prod.config(text=f"{v:.2f}", fg=speed_color(abs(v)))
 
     def _coef_value(self) -> float | None:
-        """系数框里的数字 → 数值：第一位整数、其余小数（115 → 1.15、85 → 0.85、8 → 8）。"""
+        """系数框里的数字 → 数值：第一位整数、其余小数（115 → 1.15、85 → 8.5、085 → 0.85）。"""
         s = self.coef.get().strip()
-        if not s or not s.isdigit():
+        if not s or not (s.isascii() and s.isdigit()):
             return None
         return int(s) / (10 ** (len(s) - 1))
 
     def _coef_ok(self, proposed: str) -> bool:
         """输入校验：只放数字，最多 COEF_DIGITS 位（第一位整数 + 后面几位小数）。"""
-        return proposed == "" or (proposed.isdigit() and len(proposed) <= self.COEF_DIGITS)
+        return proposed == "" or (
+            proposed.isascii() and proposed.isdigit()
+            and len(proposed) <= self.COEF_DIGITS)
 
     def _popup(self, e) -> None:
         # 记下菜单占的屏幕区域：Windows 上菜单被销毁后那块常常不会被重画，留个白框。

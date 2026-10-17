@@ -741,7 +741,7 @@ def _fit_disc_local(rgb: np.ndarray, cx: float, cy: float, half: int,
     min_a = max(60, int(0.00012 * rgb.shape[0] * rgb.shape[1]))
     comps = label_components(vivid, keep_pixels=True, min_area=min_a)
     if not comps:
-        return []
+        return None
     comp = comps[0]
     px = comp.pixels
     top: dict[int, int] = {}
@@ -868,7 +868,10 @@ def _find_dial_by_disc(rgb: np.ndarray, arrow: np.ndarray,
             continue        # 半径离先验太远：多半拟合到别的东西
         if abs(2 * fit["a"] - comp.w) / max(comp.w, 1) > 0.25:
             continue
-        if not _in_gauge_zone(fit["cx"], fit["cy"], rgb.shape, side):
+        # fit 的中心是草地圆盘中心；Dial.cy 的语义是风盘中心。
+        # 盘心在风盘中心上方 0.30·r·0.522，所以这里必须加回同一偏移。
+        gauge_cy = float(fit["cy"]) + 0.30 * panel_r_try * CONFIG.disc_panel_ratio
+        if not _in_gauge_zone(fit["cx"], gauge_cy, rgb.shape, side):
             continue
         if not _disc_has_arrow(arrow, fit):
             continue
@@ -879,7 +882,8 @@ def _find_dial_by_disc(rgb: np.ndarray, arrow: np.ndarray,
     if best is None:
         return None
     _, fit, panel_r = best
-    d = Dial(kind=KIND_GAUGE, cx=fit["cx"], cy=fit["cy"], r=panel_r,
+    gauge_cy = float(fit["cy"]) + 0.30 * panel_r * CONFIG.disc_panel_ratio
+    d = Dial(kind=KIND_GAUGE, cx=fit["cx"], cy=gauge_cy, r=panel_r,
              k=float(fit["k"]), anchored_by="disc")
     if verbose:
         print(f"[定位] 草地圆盘法：{2*fit['a']:.0f}×{2*fit['b']:.0f} k={fit['k']:.3f} "
@@ -910,10 +914,11 @@ def _find_dial_by_arrow(rgb: np.ndarray, arrow: np.ndarray,
             continue
         if not (0.72 * r_prior <= fit["a"] / CONFIG.disc_panel_ratio <= 1.32 * r_prior):
             continue
-        if not _in_gauge_zone(fit["cx"], fit["cy"], rgb.shape, side):
+        panel_r = fit["a"] / CONFIG.disc_panel_ratio
+        gauge_cy = float(fit["cy"]) + 0.30 * panel_r * CONFIG.disc_panel_ratio
+        if not _in_gauge_zone(fit["cx"], gauge_cy, rgb.shape, side):
             continue
-        d = Dial(kind=KIND_GAUGE, cx=fit["cx"], cy=fit["cy"],
-                 r=fit["a"] / CONFIG.disc_panel_ratio,
+        d = Dial(kind=KIND_GAUGE, cx=fit["cx"], cy=gauge_cy, r=panel_r,
                  k=float(fit["k"]), anchored_by="arrow+disc")
         if verbose:
             print(f"[定位] 箭头+圆盘：k={fit['k']:.3f} -> 中心=({d.cx:.0f},{d.cy:.0f})")
@@ -1159,10 +1164,19 @@ def find_dials(rgb: np.ndarray, hsv: np.ndarray | None = None,
             continue
         merged.append(d)
 
+    def in_frame(d: Dial) -> bool:
+        return (d.cx - d.r >= -0.05 * d.r and d.cx + d.r <= img_w + 0.05 * d.r
+                and d.cy - d.r >= -0.05 * d.r and d.cy + d.r <= img_h + 0.05 * d.r)
+
+    def fallback() -> Dial | None:
+        return (_find_dial_by_arrow_color(rgb, hsv, cyan, verbose, side)
+                or _find_dial_by_disc(rgb, cyan, verbose, side)
+                or _find_dial_by_arrow(rgb, cyan, verbose, side))
+
+    fallback_tried = False
     if not merged:
-        d2 = (_find_dial_by_arrow_color(rgb, hsv, cyan, verbose, side)
-              or _find_dial_by_disc(rgb, cyan, verbose, side)
-              or _find_dial_by_arrow(rgb, cyan, verbose, side))
+        fallback_tried = True
+        d2 = fallback()
         if d2 is not None:
             merged = [d2]
     else:
@@ -1175,12 +1189,16 @@ def find_dials(rgb: np.ndarray, hsv: np.ndarray | None = None,
                 d.k = float(fit["k"])
     # 风盘整个都在画面里（贴边被裁掉一半的圆环不是风盘 —— 之前会把画面边缘的
     # 白色 UI 当成风盘，读出来一串乱七八糟的数字）
-    good = [d for d in merged
-            if (d.cx - d.r >= -0.05 * d.r and d.cx + d.r <= img_w + 0.05 * d.r
-                and d.cy - d.r >= -0.05 * d.r and d.cy + d.r <= img_h + 0.05 * d.r)]
+    good = [d for d in merged if in_frame(d)]
     # 最后一道闸（跟先验那条路同一个判据）：白环不闭合、盘内也没有 "Nm/s" 数字行的，
     # 一律不算风盘 —— 剩下的白环/圆盘/箭头锚点候选本来就最容易撞上背景里的绿影。
     good = [d for d in good if gauge_verified(rgb, d, verbose)]
+    # 白环候选可能全部被最终校验否掉（小地图/其它白色 UI）。这时不能因为
+    # merged 非空就跳过备用定位；否则真正的风盘明明能被箭头/圆盘找到，也会返回空。
+    if not good and not fallback_tried:
+        d2 = fallback()
+        if d2 is not None and in_frame(d2) and gauge_verified(rgb, d2, verbose):
+            good = [d2]
     # 统一校准俯视压缩比 k：用盘面实测值，不再吃写死的常数（见 measure_disc_k 注释）。
     for d in good:
         _calibrate_disc(rgb, d, verbose)
@@ -1580,6 +1598,7 @@ def measure_arrow(rgb: np.ndarray, hsv: np.ndarray, dial: Dial,
         if P_top is None or len(P_top) < 60:
             P_top, use_top = P_sil, False
         P_use = P_top if use_top else P_sil
+        src = "顶面" if use_top else "剪影"
         phi, samples = estimate_direction(P_use)
     if not samples:
         return None

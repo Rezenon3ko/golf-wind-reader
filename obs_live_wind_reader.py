@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OBS 直播风向识别（obs-websocket 抓源，固定 1 次/秒）
+OBS 直播风向识别（obs-websocket 抓源，默认 4 次/秒）
 
 先在 OBS 里启用 WebSocket 服务器（OBS 28+ 默认已启用），再运行：
 
@@ -9,7 +9,8 @@ OBS 直播风向识别（obs-websocket 抓源，固定 1 次/秒）
     python3 obs_live_wind_reader.py -t             # 抓一帧识别一次，打印详情后退出
     python3 obs_live_wind_reader.py --obs-source "视频采集设备"
 
-取帧走 obs-websocket 的 GetSourceScreenshot（1920×1080 JPEG q100）：
+取帧走 obs-websocket 的 GetSourceScreenshot（1920×1080 JPEG q90，可用
+NSSR_JPG_QUALITY 覆盖）：
 不依赖摄像头驱动、不占摄像头，也不需要"启动虚拟摄像机"。
 
 依赖：numpy + Pillow + obsws-python。
@@ -366,7 +367,7 @@ class ObsWebSocketSource:
     def _pick_source(source: str | None, inputs: list[dict]) -> str:
         """
         挑源名，优先级：
-          1) 传进来的 source（库里可显式指定；命令行版固定传 None）
+          1) 传进来的 source（库里/命令行 --obs-source 可显式指定；默认 None 自动识别）
           2) 按 inputKind 自动找采集设备（与界面语言无关）
           3) 常见源名（多语言兜底）
           4) 只有一个源 / 第一个源
@@ -467,10 +468,10 @@ class ObsWebSocketSource:
             pass
 
 
-def make_source():
-    """按默认约定建取帧器：源名自动识别、地址/端口/密码读 OBS 配置（可用环境变量覆盖）。"""
+def make_source(source: str | None = None):
+    """按约定建取帧器：源名默认自动识别，地址/端口/密码读 OBS 配置（可用环境变量覆盖）。"""
     cfg = _obs_ws_defaults()
-    return ObsWebSocketSource(source=None, host=cfg["host"], port=cfg["port"],
+    return ObsWebSocketSource(source=source, host=cfg["host"], port=cfg["port"],
                               password=cfg["password"],
                               width=WIDTH, height=HEIGHT, quality=QUALITY)
 
@@ -539,7 +540,15 @@ class Recognizer:
     def reset(self) -> None:
         """丢掉缓存的定位（保留左右手锁定），下帧重新找 —— 识别出错时用。"""
         self.dial, self.shape, self.bad = None, None, 0
+        self._reset_angle_state()
+
+    def _reset_angle_state(self) -> None:
+        """清空跟风盘位置/洞相关的角度平滑与迟滞状态。"""
+        self.last_theta = None
+        self.flip_run = 0
+        self.turn_run = 0
         self.ema = self.shown = None
+        self.last_dir = {}
 
     # ---- 风速锁定：同一洞风速固定，锁住它就不会被单帧数字误读带跑 ----
     def _update_lock(self, fr) -> None:
@@ -549,7 +558,7 @@ class Recognizer:
         怎么锁：看到风向盘后先**正常测 WIND_MEASURE_S 秒**，把这几秒里的读数按**值**归并，
         取"置信度之和"最高的那个值锁住 —— 也就是 票数 × 平均置信度。
         另外还有一条**早锁**：满窗口之前，只要"票够多（4 拍）+ 跨度够（0.6s）+ 一边倒
-        （平均置信度 ≥0.85、占前两名 ≥0.80）"就立刻锁 —— 4 次/秒下约 1 秒就定，而不是干等 3 秒
+        （平均置信度 ≥0.82、占前两名 ≥0.80）"就立刻锁 —— 4 次/秒下约 1 秒就定，而不是干等 3 秒
         （见 LOCK_EARLY_* 与 _early_lock_ok）。
 
         为什么不是"单拍置信度最高"：单拍高分可能正好是误读。按"和"排就好：读得又多又像的
@@ -587,6 +596,11 @@ class Recognizer:
             if self.votes:
                 ranked = sorted(self.votes.items(), key=lambda kv: (-kv[1][1], -kv[1][0]))
                 v, (n, s) = ranked[0]
+                if self.choice_options is not None:
+                    # 备选弹窗一旦出现，只能由玩家点击或超时展开来决定；
+                    # 后续帧即使票数变得一边倒，也不能绕过玩家直接锁定。
+                    self._expand_choice_if_timeout(now)
+                    return
                 if n < LOCK_MIN_VOTES:
                     # 只有孤零零一拍读到它 → 先不锁，继续收票（真在瞄准界面的话下一拍就来第二票）。
                     # 单拍读错是最常见的"锁错风速"，而锁错之后整洞都在显示错值，代价太大。
@@ -698,7 +712,7 @@ class Recognizer:
         够不够"早锁"（不等满 WIND_MEASURE_S 就定下来）—— 四条同时满足：
           ① 第一名 ≥ LOCK_EARLY_VOTES 拍（4 拍，比"1 拍就锁"的老 bug 严得多）
           ② 这 4 票横跨 ≥ LOCK_EARLY_SPAN_S（0.6s；帧率越高越重要，防止一瞬间连出 4 帧）
-          ③ 平均置信度 ≥ LOCK_EARLY_CONF（0.85）—— 弱读（best_effort，带 ? 的）自然被挡住
+          ③ 平均置信度 ≥ LOCK_EARLY_CONF（0.82）—— 弱读（best_effort，带 ? 的）自然被挡住
           ④ 第一名占前两名置信度之和 ≥ LOCK_EARLY_RATIO（0.80）—— 咬得紧就等满窗口再问玩家
         为什么敢比满窗口那条更早定：画面在瞄准界面里基本不动，"多等 2 秒"买不到新信息
         （多出来的样本主要在压噪声）；而**系统性**读错（例如 15 被截成 1）不靠票数防，
@@ -763,6 +777,7 @@ class Recognizer:
         self.lock_mismatch = ""
         self.band_asked = False
         self._clear_choice()
+        self._reset_angle_state()
 
     def _wind_gone(self) -> None:
         """
@@ -826,6 +841,9 @@ class Recognizer:
             return {"ok": False, "message": "未找到风盘",
                     "speed_locked": self.locked is not None, "lock_event": self.lock_event}
 
+        # 风盘本身已经通过校验。即使这一拍没找到箭头/没读出数字，也不能把
+        # 这个可见的风盘算成“消失”，否则会把测量投票提前清掉。
+        self.dial_t = time.time()
         # 每帧都重新读风速（模板匹配只要 ~4ms，读准了才知道箭头该是什么颜色）
         fr = W.read_wind(rgb, d, ocr_state=self.ocr)
         # fr.ok 且找到箭头就算"这一帧读到了"：只认出颜色档、数字没读出的帧方向照样显示，
@@ -853,7 +871,6 @@ class Recognizer:
                     "speed_locked": self.locked is not None, "lock_event": self.lock_event}
         if fr.no_wind:
             self.no_wind = True
-            self.dial_t = time.time()             # 0 m/s 也是"风盘在"：别把它算成消失
             if self.locked is not None:
                 # 锁着 7 m/s 却读到 0 m/s：同一洞风速不会变，所以这基本只有两种可能 ——
                 # 真换洞了（新洞无风），或者数字被读成了 0。两种情况都该解锁重测。
@@ -868,7 +885,6 @@ class Recognizer:
                     "speed_locked": self.locked is not None, "lock_event": self.lock_event}
 
         # ---- 这一帧确实看到了风向盘：先更新锁定状态，再用锁定值覆盖风速 ----
-        self.dial_t = time.time()
         self._update_lock(fr)
         if self.locked is not None:
             # 锁上了：风速用锁定值（数字这一拍读成什么、读没读出来都不影响显示），
@@ -1089,14 +1105,17 @@ def print_test_report(st: dict, rgb) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="OBS 直播风向识别（obs-websocket 抓源，固定 1 次/秒）",
+        description="OBS 直播风向识别（obs-websocket 抓源，按 FPS 识别）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="示例：\n"
                "  python3 obs_live_wind_reader.py                # 挂机识别\n"
-               "  python3 obs_live_wind_reader.py -t             # 抓一帧做一次识别\n")
+               "  python3 obs_live_wind_reader.py -t             # 抓一帧做一次识别\n"
+               "  python3 obs_live_wind_reader.py --obs-source \"视频采集设备\"\n")
     p.add_argument("-t", "--test", action="store_true",
                    help="测试模式：抓一帧做一次识别，打印详情后退出")
     p.add_argument("-v", "--verbose", action="store_true", help="打印定位、耗时等细节")
+    p.add_argument("--obs-source", default=None,
+                   help="OBS 源名（默认按采集设备类型自动识别）")
     return p
 
 
@@ -1104,11 +1123,11 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
 
     try:
-        src = make_source()
+        src = make_source(args.obs_source)
     except Exception as exc:
         print(f"✗ 取帧失败：{exc}")
         print("  排查：OBS → 工具 → WebSocket 服务器设置 → 勾选「启用 WebSocket 服务器」")
-        print("        （端口/密码自动读 OBS 配置；源按类型自动识别，不用指定名字）")
+        print("        （端口/密码自动读 OBS 配置；源可自动识别，或用 --obs-source 指定）")
         return 2
 
     rec = Recognizer(args)
@@ -1131,9 +1150,9 @@ def main(argv=None) -> int:
         print_test_report(st, rgb)
         return 0 if st.get("ok") else 3
 
-    # ---------- 实时循环：固定 1 次/秒 ----------
+    # ---------- 实时循环：按 FPS 识别 ----------
     min_dt = 1.0 / FPS
-    print(f"[识别] 固定 {FPS:g} 次/秒  （Ctrl-C 退出）")
+    print(f"[识别] 按 {FPS:g} 次/秒  （Ctrl-C 退出）")
     frames = reads = ok_frames = 0
     t_start = last_print = last_rec = time.time()
     st: dict = {"ok": False, "message": "启动中…"}
@@ -1153,7 +1172,7 @@ def main(argv=None) -> int:
                     src.close()
                     while True:
                         try:
-                            src = make_source()
+                            src = make_source(args.obs_source)
                             break
                         except Exception as exc:
                             print(f"\n⚠ 重连失败：{exc}（3 秒后再试，Ctrl-C 退出）")
