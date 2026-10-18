@@ -336,14 +336,26 @@ def _clean_white_mask(mask: np.ndarray) -> np.ndarray:
     return _drop_small_blobs(_open_mask(mask))
 
 
-def _hole_count(mask: np.ndarray) -> int:
+HOLE_MIN_AREA_FRAC = 0.01     # 归一化字形里小于约 1% 墨量的洞视为二值化噪点
+HOLE_MIN_AREA_PX = 8         # 小字形也有个绝对下限，防止极细字迹把阈值降到 0
+HOLE_PENALTY = 0.10          # 洞数不一致时给形状分的软惩罚；不直接排除模板
+
+
+def _hole_count(mask: np.ndarray, min_area: int | None = None) -> int:
     """
     数字的"洞"数：8→2，0/6/9→1，1/2/3/4/5/7→0。
 
     拓扑是认数字最稳的一条线索 —— 8 和 6 的像素相似度高达 0.79（10 个模板里最像的一对），
     光靠 IoU 分不开；但"两个洞"和"一个洞"永远不会错。
+
+    洞的**面积**必须够大：压缩/变暗后，5 的字迹里可能出现 1~3 像素的假洞；
+    以前用 min_area=3 会把这种噪点当成拓扑证据，反而排除正确的 5 模板。
+    默认把面积小于 `max(8, 约 1% 墨量)` 的洞忽略。
     """
-    comps = label_components(~mask, keep_pixels=False, min_area=3)
+    m = np.asarray(mask, dtype=bool)
+    if min_area is None:
+        min_area = max(HOLE_MIN_AREA_PX, int(HOLE_MIN_AREA_FRAC * int(m.sum())))
+    comps = label_components(~m, keep_pixels=False, min_area=min_area)
     h, w = mask.shape
     return sum(1 for c in comps
                if c.x0 > 0 and c.y0 > 0 and c.x1 < w - 1 and c.y1 < h - 1)
@@ -1773,6 +1785,30 @@ def _line_band(mask: np.ndarray) -> tuple[int, int]:
     return int(idx[0]), int(idx[-1]) + 1
 
 
+def _trim_glyph_edges(mask: np.ndarray, min_support: int = 2) -> np.ndarray:
+    """
+    去掉字形最外侧的孤立低墨量行/列。
+
+    2/5 的边缘偶尔会粘上一两个孤立的亮像素；它们会把包围盒撑宽，随后横向归一化
+    又把整个字形压扁。这里只修剪最外侧“整行/整列不足 min_support 个墨点”的部分，
+    不动内部笔画，避免把 1/4/7 的细笔画一起削掉。
+    """
+    a = np.asarray(mask, dtype=bool)
+    while a.shape[0] > 5 and (
+            a[0, :].sum() < min_support or a[-1, :].sum() < min_support):
+        if a[0, :].sum() < min_support:
+            a = a[1:, :]
+        if a.shape[0] > 5 and a[-1, :].sum() < min_support:
+            a = a[:-1, :]
+    while a.shape[1] > 5 and (
+            a[:, 0].sum() < min_support or a[:, -1].sum() < min_support):
+        if a[:, 0].sum() < min_support:
+            a = a[:, 1:]
+        if a.shape[1] > 5 and a[:, -1].sum() < min_support:
+            a = a[:, :-1]
+    return a
+
+
 def _glyph_norm(crop: Image.Image,
                 band: tuple[int, int] | None = None) -> np.ndarray | None:
     """
@@ -1782,6 +1818,9 @@ def _glyph_norm(crop: Image.Image,
     抗锯齿多出来的那一两行/一两列会把细笔画（比如 "1"）整个压扁，分数就掉一大截。
     给了 band 就按它定高度；水平方向仍按本字形自己的墨迹取满 —— 宽度正是区分数字的
     依据，不能掐（"1" 顶上那个小撇子墨很少，一掐就只剩一根竖杠了）。
+
+    归一化前会修剪外侧支撑不足 2 像素的行/列，去掉 2/5 边缘偶然粘上的亮像素；
+    之后仍按原始二值图放大，匹配阶段再用 1 像素宽容度处理抗锯齿差异。
     """
     # 二值化必须用"本字形这块"自己的阈值（_bin_white 是按裁块中位亮度定阈的），
     # 拿整行算好的掩膜切下来会换一套口径，和模板库的建库口径对不上 —— 别省这一步。
@@ -1794,7 +1833,13 @@ def _glyph_norm(crop: Image.Image,
     if len(ys) < 12:
         return None
     sub = sub[:, xs.min():xs.max() + 1]
-    im = Image.fromarray((sub * 255).astype(np.uint8)).resize(_GLYPH_SIZE, Image.BILINEAR)
+    sub = _trim_glyph_edges(sub)
+    ys, xs = np.nonzero(sub)
+    if len(ys) < 12:
+        return None
+    sub = sub[:, xs.min():xs.max() + 1]
+    im = Image.fromarray((sub * 255).astype(np.uint8)).resize(
+        _GLYPH_SIZE, Image.BILINEAR)
     return (np.asarray(im) > 110).astype(np.float32)
 
 
@@ -1807,6 +1852,47 @@ def _glyph_sim(a: np.ndarray, b: np.ndarray) -> float:
     denom = (np.linalg.norm(aa) * np.linalg.norm(bb))
     ncc = float(aa @ bb / denom) if denom > 1e-6 else 0.0
     return 0.5 * iou + 0.5 * max(ncc, 0.0)
+
+
+SOFT_MATCH_EXACT_WEIGHT = 0.5
+_SOFT_DILATE_CACHE: dict[tuple[tuple[int, int], bytes], np.ndarray] = {}
+
+
+def _dilate1(mask: np.ndarray) -> np.ndarray:
+    """四邻域膨胀 1 像素（结果缓存，模板和同一字形会被反复比较）。"""
+    a = np.asarray(mask, dtype=bool)
+    key = (a.shape, a.tobytes())
+    out = _SOFT_DILATE_CACHE.get(key)
+    if out is None:
+        out = a.copy()
+        out[1:, :] |= a[:-1, :]
+        out[:-1, :] |= a[1:, :]
+        out[:, 1:] |= a[:, :-1]
+        out[:, :-1] |= a[:, 1:]
+        if len(_SOFT_DILATE_CACHE) > 1024:
+            _SOFT_DILATE_CACHE.clear()
+        _SOFT_DILATE_CACHE[key] = out
+    return out
+
+
+def _glyph_sim_soft(a: np.ndarray, b: np.ndarray) -> float:
+    """
+    对边缘更宽容的相似度：允许笔画边界错开 1 像素。
+
+    二值 IoU 对 2/5 边缘的一两个凸起非常敏感，而这些凸起经常只是采集/缩放产生的。
+    这里把精确相似度和“互相覆盖对方 1 像素膨胀”的宽容覆盖率各占一半；拓扑和
+    5/6/8 冲突保护仍然是更硬的约束。
+    """
+    exact = _glyph_sim(a, b)
+    ab, bb = a > 0.5, b > 0.5
+    if not ab.any() or not bb.any():
+        return exact
+    tolerant = 0.5 * (
+        (ab & _dilate1(bb)).sum() / ab.sum()
+        + (bb & _dilate1(ab)).sum() / bb.sum()
+    )
+    return (SOFT_MATCH_EXACT_WEIGHT * exact
+            + (1.0 - SOFT_MATCH_EXACT_WEIGHT) * float(tolerant))
 
 
 def load_glyph_bank(path: str, state: OcrState | None = None) -> int:
@@ -1964,6 +2050,7 @@ def match_glyphs(crop: Image.Image,
         out, worst = "", 1.0
         alt_out, alt_worst = "", 1.0
         ambig = False
+        topology_uncertain = False
         for a, b in win:
             key = (int(a), int(b))
             if key not in normed:            # 各候选窗口大量重叠，同一块别算两遍
@@ -1975,25 +2062,53 @@ def match_glyphs(crop: Image.Image,
             if holes_of[key] < 0:
                 holes_of[key] = _hole_count(g > 0.5)
             best, second, digit = 0.0, 0.0, ""
+            best_hole_diff = 0
+            raw_best, raw_digit = 0.0, ""
             best_ok, digit_ok = 0.0, ""
-            # 拓扑约束：字形**看得出洞**时，洞数必须和模板一致。8 是唯一有两个洞的数字，
-            # 而 8 和 6 的像素相似度高达 0.79（全库最像的一对）—— 只靠 IoU 会互相认错。
-            # 只在输入确实有洞时才卡（洞=0 也可能是圈被抗锯齿/压缩咬断了，不能反过来定死）。
-            # 洞数不符的模板直接不进 best/second，否则 8 的那点差距会被 6 抢走。
+            # 拓扑约束用"软惩罚"，不直接排除模板：
+            #   · 8 和 6 的像素相似度高达 0.79，洞数是重要的第二证据；
+            #   · 但硬排除会把"8 的上洞被糊掉"直接判成 6，也会让 5 的 1~3 像素假洞
+            #     反过来排除正确的 5 模板。
+            # 洞数差 1 扣 0.10，差 2 扣 0.20；如果最佳候选是 5/6/8、拓扑与输入不一致，
+            # 且形状分差不够大，就判为 ambiguous，宁可让玩家选，也不能自动锁错。
             holes_g = holes_of[key]
+            # 先按数字聚合：同一数字的多个真实/字体模板只贡献一个类别分数。
+            # 不能让同数字的第二个模板占住 second，否则多模板会误伤严格判据。
+            per_digit: dict[str, tuple[float, int]] = {}
+            per_digit_raw: dict[str, float] = {}
+            per_digit_ok: dict[str, float] = {}
             for d, temps in bank.items():
                 allowed = accept is None or accept(int(d))
+                d_best, d_hole, d_raw, d_ok = -1.0, 0, -1.0, -1.0
                 for t in temps:
-                    if holes_g and _template_holes(t) != holes_g:
-                        continue
-                    sc = _glyph_sim(g, t)
-                    if sc > best:
-                        second = max(second, best)
-                        best, digit = sc, d
-                    else:
-                        second = max(second, sc)
-                    if allowed and sc > best_ok:
-                        best_ok, digit_ok = sc, d
+                    hole_t = _template_holes(t)
+                    hole_diff = abs(holes_g - hole_t)
+                    raw_sc = _glyph_sim_soft(g, t)
+                    sc = raw_sc - HOLE_PENALTY * min(hole_diff, 2)
+                    d_raw = max(d_raw, raw_sc)
+                    if sc > d_best:
+                        d_best, d_hole = sc, hole_diff
+                    if allowed:
+                        d_ok = max(d_ok, sc)
+                if d_best >= 0:
+                    per_digit[d] = (d_best, d_hole)
+                if d_raw >= 0:
+                    per_digit_raw[d] = d_raw
+                if d_ok >= 0:
+                    per_digit_ok[d] = d_ok
+            if per_digit:
+                ranked = sorted(
+                    ((s, d, hd) for d, (s, hd) in per_digit.items()),
+                    reverse=True,
+                )
+                best, digit, best_hole_diff = ranked[0]
+                second = ranked[1][0] if len(ranked) > 1 else 0.0
+            if per_digit_raw:
+                raw_best, raw_digit = max(
+                    ((s, d) for d, s in per_digit_raw.items()))
+            if per_digit_ok:
+                best_ok, digit_ok = max(
+                    ((s, d) for d, s in per_digit_ok.items()))
             if best_ok > 0:
                 alt_out += digit_ok
                 alt_worst = min(alt_worst, best_ok)
@@ -2005,6 +2120,20 @@ def match_glyphs(crop: Image.Image,
             # 但"绝对分很高"本身就是强证据，这时差距可以放宽：实测真图里的 "6" 是
             # 0.820 / 次 0.731（差 0.088），和 "8" 差一口气就差 0.01 没够着 0.10，
             # 结果真数字被判掉、反而让杂块钻空子 —— 所以 0.80 以上放宽到 0.06。
+            topology_uncertain = (
+                digit in {"5", "6", "8"}
+                and holes_g > 0
+                and best_hole_diff > 0
+                and best - second < 0.12
+            )
+            # 形状分（不加拓扑惩罚）和带惩罚后的第一名不是同一个 5/6/8：
+            # 说明切分/二值化可能把拓扑弄坏了。不要把这种冲突交给分数硬判。
+            if (raw_digit in {"5", "6", "8"} and digit in {"5", "6", "8"}
+                    and raw_digit != digit):
+                topology_uncertain = True
+            if topology_uncertain:
+                ambig = True
+                break
             if best < 0.60 or (best - second < 0.06 and best < 0.80):
                 # 两种情况必须分开：
                 #   · best < 0.60 —— 这块根本不像数字（m / s / 杂块）→ 换下一组，
@@ -2023,9 +2152,10 @@ def match_glyphs(crop: Image.Image,
         else:
             if (accept is None or accept(int(out))) and not _span_tainted(win, tainted):
                 return out, worst           # 整组都匹配上、数值也合理，才算数
-        if ambig and out:
+        if (ambig and out) or topology_uncertain:
             tainted.extend(win)             # 这一组的列区间作废（含已匹配上的那几位）
-        if best_effort and len(alt_out) == len(win) and alt_worst >= 0.45:
+        if (best_effort and not topology_uncertain
+                and len(alt_out) == len(win) and alt_worst >= 0.45):
             if fallback is None or alt_worst > fallback[0]:
                 fallback = (alt_worst, alt_out)
     if fallback is not None:
@@ -2156,7 +2286,7 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
     fr = FrameReading(dial=dial)
     ss = max(1, int(supersample or SUPERSAMPLE))
     weak = False                                 # 数字只是"勉强过线"（best_effort）读出来的
-    band_hint = None                             # 箭头自己的颜色档（读数字用，也是区间显示的来源）
+    band_hint = None                             # 箭头自己的颜色档（严格档用于限制 OCR；放宽档只留给方向）
     band_strict = False                          # 严格档（不放宽）认出了箭头颜色 —— "盘里真有箭头"的判据
     boxes: list | None = None                    # 文字行候选框（一帧只搜一次，多轮复用）
     if speed is None and do_ocr:
@@ -2168,7 +2298,10 @@ def read_wind(rgb: np.ndarray, dial: Dial, *, speed: float | None = None,
         band_strict = band_hint is not None
         if band_hint is None:                       # 颜色被采集卡洗淡时，放宽 S/V 再认一次
             band_hint = detect_arrow_band(rgb, dial, min_px=60, relax=0.30)
-        if band_hint is not None:
+        # 只有严格颜色档才作为 OCR 的硬先验。放宽档可能是背景蓝色/绿色造成的假阳性：
+        # 无风画面的空盘如果先被限制到 1~5，就会把合法的 "0" 排除掉（实测 0m/s 帧读成 1/5）。
+        # 放宽档仍然保留在 band_hint 里，供后面找箭头/显示区间使用。
+        if band_strict:
             lo, hi = wind_range(band_hint)
 
             def in_band(v, lo=lo, hi=hi):

@@ -10,10 +10,16 @@
 
 用法：
     python3 build_glyph_bank.py                  # 用 字形素材/ 里的 0.png..9.png
+    python3 build_glyph_bank.py --samples 字形素材/多帧样本
+                                                 # 用 N/N-1.png 多帧中位数投票
     python3 build_glyph_bank.py --materials 别的目录
     python3 build_glyph_bank.py --no-write       # 只跑自检，不覆盖 glyph_bank.npz
 
-素材命名：`N.png`，N 就是那一帧显示的风速（0~9）。脚本会**强制自检**：重建之后，
+素材有两种命名：
+  * 单样本：`N.png`，N 就是那一帧显示的风速（0~9）；
+  * 多样本：`多帧样本/N/N-1.png`、`N-2.png`……，同数字取多帧中位数投票。
+
+脚本会**强制自检**：重建之后，
 每一张素材都必须能被自己的新库读回它自己的数字，否则直接报错退出（不让坏库落盘）。
 
 顺带产出统一裁切图 `字形素材/裁切/N.png` + `_meta.json`（记录每张图的风盘几何，
@@ -27,6 +33,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import sys
@@ -119,6 +126,51 @@ def collect(materials: str, crops_dir: str | None):
     return bank, stats
 
 
+def _sample_files(materials: str, ch: str) -> list[str]:
+    """单样本 N.png 或多帧样本 N/N-*.png。"""
+    direct = os.path.join(materials, f"{ch}.png")
+    if os.path.exists(direct):
+        return [direct]
+    return sorted(glob.glob(os.path.join(materials, ch, "*.png")))
+
+
+def collect_multi(materials: str, crops_dir: str | None):
+    """从多帧整帧样本提取，每个数字做二值中位数投票。"""
+    bank: dict[str, list] = {}
+    stats = []
+    meta_all = {}
+    for ch in DIGITS:
+        paths = _sample_files(materials, ch)
+        if not paths:
+            raise SystemExit(f"✗ 缺多帧素材：{os.path.join(materials, ch)}/*.png")
+        glyphs = []
+        for i, path in enumerate(paths, 1):
+            full = np.asarray(Image.open(path).convert("RGB"))
+            dial = _dial_of_frame(full)
+            box = W._dial_box(dial, full.shape)
+            if crops_dir:
+                out_dir = os.path.join(crops_dir, ch)
+                os.makedirs(out_dir, exist_ok=True)
+                Image.fromarray(full[box[1]:box[3], box[0]:box[2]]).save(
+                    os.path.join(out_dir, f"{ch}-{i}.png"))
+                meta_all[f"{ch}-{i}"] = dict(
+                    cx=dial.cx, cy=dial.cy, r=dial.r, k=dial.k,
+                    box=list(box),
+                    disc=list(dial.disc) if dial.disc else None)
+            glyph, line, runs = digit_glyph(full, dial)
+            glyphs.append(glyph)
+            stats.append((ch, os.path.basename(path), line, runs,
+                          (dial.cx, dial.cy, dial.r)))
+        merged = np.median(np.stack(glyphs), axis=0)
+        bank[ch] = [(merged >= 0.5).astype(np.float32)]
+    if crops_dir and meta_all:
+        os.makedirs(crops_dir, exist_ok=True)
+        with open(os.path.join(crops_dir, "_meta_multi.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(meta_all, fh, ensure_ascii=False, indent=1)
+    return bank, stats
+
+
 def self_test(bank: dict, materials: str, crops_dir: str | None) -> int:
     """自检：拿新库去认每张素材，必须 10/10 读回自己的数字。"""
     st = W.OcrState()
@@ -148,6 +200,28 @@ def self_test(bank: dict, materials: str, crops_dir: str | None) -> int:
     return bad
 
 
+def self_test_multi(bank: dict, materials: str, crops_dir: str | None) -> int:
+    """多帧自检：每个数字的每一张样本都要被共识库读回自己的数字。"""
+    st = W.OcrState()
+    st.bank = bank
+    bad = []
+    for ch in DIGITS:
+        for path in _sample_files(materials, ch):
+            full = np.asarray(Image.open(path).convert("RGB"))
+            dial = _dial_of_frame(full)
+            got = None
+            for box in W._find_text_lines(full, dial):
+                x0, y0, x1, y1 = box
+                tm = W.match_glyphs(
+                    Image.fromarray(full[y0:y1, x0:x1]), state=st)
+                if tm is not None:
+                    got = tm[0]
+                    break
+            if got != ch:
+                bad.append((os.path.basename(path), ch, got))
+    return bad
+
+
 def confusion(bank: dict) -> None:
     """打印两两相似度最高（最容易认错）的几对，改库/改切分时看它。"""
     pairs = []
@@ -165,32 +239,43 @@ def main(argv=None) -> int:
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser(description="重建风速数字字形库")
     ap.add_argument("--materials", default=os.path.join(here, "字形素材"))
-    ap.add_argument("--crops", default=os.path.join(here, "字形素材", "裁切"),
-                    help="统一裁切图的输出目录（同时也是「只有裁切图」时的输入）")
+    ap.add_argument("--samples", default=None,
+                    help="多帧样本根目录（例如 字形素材/多帧样本）")
+    ap.add_argument("--crops", default=None,
+                    help="统一裁切图的输出目录（默认按单样本/多帧模式选择）")
     ap.add_argument("--out", default=os.path.join(here, "glyph_bank.npz"))
     ap.add_argument("--no-write", action="store_true", help="只跑自检，不覆盖已有的库")
     ap.add_argument("--no-crops", action="store_true", help="不落盘裁切图")
     args = ap.parse_args(argv)
 
-    crops = None if args.no_crops else args.crops
-    bank, stats = collect(args.materials, crops)
-    print(f"[1/3] 提取完成：{len(bank)} 个数字，每字 {len(bank['0'])} 个模板")
-    for ch, line, runs, geo in stats:
-        print(f"      {ch}: 风盘({geo[0]:.0f},{geo[1]:.0f}) r={geo[2]:.0f}  "
-              f"文字框{line}  列块{len(runs)}个 首块={runs[0]} 宽={runs[0][1]-runs[0][0]}")
-
-    bad = self_test(bank, args.materials, crops)
+    default_crops = os.path.join(
+        here, "字形素材", "多帧裁切" if args.samples else "裁切")
+    crops = None if args.no_crops else (args.crops or default_crops)
+    if args.samples:
+        bank, stats = collect_multi(args.samples, crops)
+        print(f"[1/3] 多帧提取完成：{len(bank)} 个数字，共 {len(stats)} 张样本")
+        for ch, name, line, runs, geo in stats:
+            print(f"      {ch}: {name} 风盘({geo[0]:.0f},{geo[1]:.0f}) "
+                  f"r={geo[2]:.0f} 文字框{line} 列块{len(runs)}个")
+        bad = self_test_multi(bank, args.samples, crops)
+    else:
+        bank, stats = collect(args.materials, crops)
+        print(f"[1/3] 提取完成：{len(bank)} 个数字，每字 {len(bank['0'])} 个模板")
+        for ch, line, runs, geo in stats:
+            print(f"      {ch}: 风盘({geo[0]:.0f},{geo[1]:.0f}) r={geo[2]:.0f}  "
+                  f"文字框{line}  列块{len(runs)}个 首块={runs[0]} 宽={runs[0][1]-runs[0][0]}")
+        bad = self_test(bank, args.materials, crops)
     if bad:
-        print("✗ 自检没通过：", "  ".join(f"{ch}被读成{got}" for ch, got in bad))
+        print("✗ 自检没通过：", bad)
         print("  库没写盘 —— 先把这几张素材的切分/字形看明白再重建。")
         return 1
-    print("[2/3] 自检通过：10/10 每张素材都读回自己的数字")
+    print("[2/3] 自检通过：每张素材都读回自己的数字")
     confusion(bank)
 
     if args.no_write:
         print("[3/3] --no-write：没有覆盖 glyph_bank.npz")
         return 0
-    # 必须用 savez_compressed：模板是二值图，压缩后 3KB 而不是 60KB（库要跟着 exe 走）
+    # 必须用 savez_compressed：二值模板压缩后很小，库要跟着 exe 走
     np.savez_compressed(args.out, **{k: np.asarray(v, dtype=np.float32) for k, v in bank.items()})
     n = W.load_glyph_bank(args.out)
     print(f"[3/3] 已写入 {args.out}（载入校验：{n} 个数字 {W.glyph_bank_digits()}）")

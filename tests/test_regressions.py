@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -183,6 +184,130 @@ class GeometryRegressionTests(unittest.TestCase):
             (cx - 50, disc_cy + 8),
         ], fill=(220, 50, 160))
         return np.asarray(im).copy(), cx, cy
+
+
+class OcrTopologyRegressionTests(unittest.TestCase):
+    @staticmethod
+    def _template(ch: str):
+        path = Path(__file__).resolve().parents[1] / "glyph_bank.npz"
+        with np.load(path, allow_pickle=False) as bank:
+            return bank[ch][0].copy()
+
+    @staticmethod
+    def _render(glyph: np.ndarray) -> Image.Image:
+        canvas = np.zeros((80, 100), dtype=np.uint8)
+        canvas[16:64, 34:66] = (glyph * 255).astype(np.uint8)
+        return Image.fromarray(canvas).convert("RGB")
+
+    def test_significant_holes_distinguish_5_6_8(self):
+        self.assertEqual(
+            [W._hole_count(self._template(ch) > 0.5) for ch in "568"],
+            [0, 1, 2])
+
+    def test_tiny_noise_hole_does_not_break_5(self):
+        glyph = self._template("5")
+        for y in range(22, 24):
+            for x in range(12, 14):
+                glyph[y, x] = 0
+
+        self.assertEqual(W._hole_count(glyph > 0.5), 0)
+        result = W.match_glyphs(self._render(glyph), state=self._state())
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "5")
+
+    def test_multiple_templates_are_aggregated_per_digit(self):
+        bank = {ch: [self._template(ch)] for ch in "0123456789"}
+        bank["5"].append(np.roll(bank["5"][0], 1, axis=1))
+        state = W.OcrState()
+        state.bank = bank
+
+        result = W.match_glyphs(
+            self._render(self._template("5")), state=state)
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "5")
+
+    def test_formal_bank_has_no_duplicate_templates(self):
+        path = Path(__file__).resolve().parents[1] / "glyph_bank.npz"
+        with np.load(path, allow_pickle=False) as bank:
+            for ch in bank.files:
+                templates = bank[ch]
+                for i in range(len(templates)):
+                    for j in range(i + 1, len(templates)):
+                        self.assertFalse(
+                            np.array_equal(templates[i], templates[j]),
+                            f"{ch} templates {i} and {j} are identical")
+
+    def test_edge_trim_removes_single_pixel_protrusion(self):
+        mask = np.zeros((20, 20), dtype=bool)
+        mask[5:15, 5:15] = True
+        mask[10, 15] = True                 # 右侧 1 像素凸起
+
+        trimmed = W._trim_glyph_edges(mask)
+        self.assertEqual(trimmed.shape[1], 10)
+
+    def test_soft_similarity_tolerates_one_pixel_shift(self):
+        original = self._template("2")
+        shifted = np.zeros_like(original)
+        shifted[:, 1:] = original[:, :-1]
+
+        exact = W._glyph_sim(original, shifted)
+        soft = W._glyph_sim_soft(original, shifted)
+        self.assertGreater(soft, exact)
+        self.assertGreater(soft, 0.90)
+
+    def test_edge_protrusion_does_not_break_2(self):
+        canvas = np.asarray(self._render(self._template("2"))).copy()
+        canvas[40:42, 66:68] = 255          # 右侧 2×2 亮块
+        result = W.match_glyphs(
+            Image.fromarray(canvas).convert("RGB"), state=self._state())
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "2")
+
+    def test_relaxed_color_band_does_not_hide_zero_wind(self):
+        dial = W.Dial(W.KIND_GAUGE, 1690, 140, 115, 0.82)
+
+        def fake_detect(*_args, **kwargs):
+            return None if kwargs.get("relax", 0) == 0 else (
+                178.0, 194.0, 0.70, 0.72)
+
+        def fake_ocr(*_args, **kwargs):
+            allow = kwargs.get("allow")
+            return dict(value=0 if allow is None else 1, raw="",
+                        conf=0.99, box=None, ok=True, reject=None)
+
+        with mock.patch.object(W, "_find_text_lines", return_value=[(0, 0, 10, 10)]), \
+                mock.patch.object(W, "detect_arrow_band", side_effect=fake_detect), \
+                mock.patch.object(W, "ocr_speed", side_effect=fake_ocr):
+            result = W.read_wind(
+                np.zeros((1080, 1920, 3), dtype=np.uint8), dial)
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.no_wind)
+        self.assertEqual(result.speed, 0.0)
+
+    def test_missing_upper_hole_never_locks_8_as_6(self):
+        glyph = self._template("8")
+        mask = glyph > 0.5
+        holes = W.label_components(~mask, keep_pixels=True, min_area=1)
+        h, w = mask.shape
+        filled = mask.copy()
+        for hole in holes:
+            if (hole.x0 > 0 and hole.y0 > 0 and hole.x1 < w - 1
+                    and hole.y1 < h - 1 and hole.cy < h * 0.5):
+                pixels = np.asarray(hole.pixels, dtype=int)
+                filled[pixels[:, 1], pixels[:, 0]] = True
+
+        result = W.match_glyphs(
+            self._render(filled.astype(np.float32)), state=self._state())
+        self.assertTrue(result is None or result[0] == "8")
+
+    @staticmethod
+    def _state():
+        state = W.OcrState()
+        W.load_glyph_bank(
+            str(Path(__file__).resolve().parents[1] / "glyph_bank.npz"),
+            state=state)
+        return state
 
 
 class InputRegressionTests(unittest.TestCase):
