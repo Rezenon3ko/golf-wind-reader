@@ -428,10 +428,12 @@ class ObsWebSocketSource:
             self._fail(f"{exc}")
             return None
         t_req = time.time() - t0
-        data = getattr(r, "image_data", "") or ""
-        if data.startswith("data:"):
-            data = data.split(",", 1)[-1]
         try:
+            data = getattr(r, "image_data", "") or ""
+            if not isinstance(data, str):
+                raise TypeError(f"image_data 类型异常：{type(data).__name__}")
+            if data.startswith("data:"):
+                data = data.split(",", 1)[-1]
             t1 = time.time()
             with Image.open(io.BytesIO(base64.b64decode(data))) as im:
                 arr = np.asarray(im.convert("RGB"))
@@ -739,13 +741,15 @@ class Recognizer:
         读数够不够一边倒？不够就让玩家来定（见 CHOICE_CONF / CHOICE_RATIO 的注释）。
         ranked 是 [(值, [拍数, 置信度之和]), ...]，已按置信度之和降序。
         """
-        if len(ranked) < 2:
-            return False                              # 只有一个候选，没得选
+        if not ranked:
+            return True
         (top_v, (top_n, top_sum)) = ranked[0]
-        second_sum = ranked[1][1][1]
         top_avg = top_sum / max(top_n, 1)
         if top_avg < CHOICE_CONF:
             return True
+        if len(ranked) < 2:
+            return False                              # 单候选，但绝对置信度已经够高
+        second_sum = ranked[1][1][1]
         return top_sum / max(top_sum + second_sum, 1e-9) < CHOICE_RATIO
 
     def choose(self, value) -> None:

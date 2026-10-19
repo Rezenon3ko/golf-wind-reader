@@ -62,7 +62,19 @@ class RecognizerRegressionTests(unittest.TestCase):
         self.assertIsNone(r.locked)
         self.assertIsNotNone(r.choice_options)
 
-        r._update_lock(frame(7))
+    def test_single_low_confidence_candidate_requests_choice(self):
+        r = _recognizer_state()
+        now = time.time()
+        r.votes = {7: [2, 0.90]}
+        r.vote_span = {7: [now - 2, now]}
+        r.vote_band_ok = {7: 2}
+        r.measure_t0 = now - O.WIND_MEASURE_S - 1
+        frame = SimpleNamespace(
+            speed=7.0, speed_range=None,
+            ocr={"conf": 0.45}, arrow_band=(50.0, 68.0, 0.70, 0.68))
+
+        r._update_lock(frame)
+
         self.assertIsNone(r.locked)
         self.assertIsNotNone(r.choice_options)
 
@@ -336,6 +348,27 @@ class InputRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(Overlay._coef_value(FakeOverlay("85")), 8.5)
         self.assertTrue(Overlay._coef_ok(FakeOverlay("85"), "85"))
         self.assertFalse(Overlay._coef_ok(FakeOverlay("¹"), "¹"))
+
+    def test_obs_non_string_image_data_is_handled(self):
+        class FakeCli:
+            def get_source_screenshot(self, *_args):
+                return SimpleNamespace(image_data=b"not-a-string")
+
+        src = object.__new__(O.ObsWebSocketSource)
+        src.cli = FakeCli()
+        src.source = "test"
+        src.fmt = "jpg"
+        src.width, src.height, src.quality = 1920, 1080, 90
+        src.fails, src.dead, src.last_error = 0, False, ""
+
+        def fail(why):
+            src.last_error = why
+            src.fails += 1
+
+        src._fail = fail
+        self.assertIsNone(src.read())
+        self.assertEqual(src.fails, 1)
+        self.assertIn("解码", src.last_error)
 
 
 if __name__ == "__main__":
