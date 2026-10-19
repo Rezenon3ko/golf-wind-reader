@@ -45,8 +45,11 @@ jobs:
       # 普通分支推送仍保留 Actions 产物，方便快速下载
       - name: 上传 Actions 产物
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        # 产物只是临时便利；配额满时不要让整个构建变红，正式包走上面的 Release
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: NSSR风向识别-exe
           path: dist/NSSR风向识别.exe
           if-no-files-found: error
+          retention-days: 1
