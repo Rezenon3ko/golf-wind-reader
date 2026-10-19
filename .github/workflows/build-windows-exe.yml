@@ -5,6 +5,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     # windows-latest = x64 的 Windows Server，PyInstaller 出来的就是 x64 exe
@@ -23,7 +26,25 @@ jobs:
       - name: 打包
         run: pyinstaller --noconfirm --clean packaging/exe.spec
 
-      - name: 上传产物
+      # 版本 tag 走 Release 附件，不占 Actions 产物配额
+      - name: 发布到 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          title="NSSR风向识别 ${tag#v}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "$title"
+          else
+            gh release create "$tag" --title "$title" --notes "Windows x64 便携版（单文件 exe）。"
+          fi
+          gh release upload "$tag" "dist/NSSR风向识别.exe" --clobber
+
+      # 普通分支推送仍保留 Actions 产物，方便快速下载
+      - name: 上传 Actions 产物
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         uses: actions/upload-artifact@v4
         with:
           name: NSSR风向识别-exe
