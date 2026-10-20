@@ -264,7 +264,10 @@ class Reader(threading.Thread):
                     src = O.make_source()
                     backoff = 3.0                 # 连上了，退避重置
                     self._log(f"已连接：{src.note}")
-                    self.out.put({"kind": "status", "text": "已连接，等待画面…"})
+                    # 把源名显示出来：选错源时（例如选到音频源）用户能立刻看出来，
+                    # 不用等到“一直没定位到风盘”再去翻日志。
+                    self.out.put({"kind": "status",
+                                  "text": f"已连接：{src.source}，等待画面…"})
                 except Exception as exc:
                     full = f"连接 OBS 失败：{exc}"
                     print("\n" + full)                      # 终端里给完整信息（双击启动时无终端，无妨）

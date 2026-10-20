@@ -102,7 +102,25 @@ CAPTURE_INPUT_KINDS = (
     "av_capture_input_v2", "av_capture_input",    # macOS 视频采集设备
     "v4l2_input",                                 # Linux 视频采集设备
     "decklink-input", "blackmagic_device",        # SDI / HDMI 采集卡
+    "game_capture",                               # 游戏采集
+    "window_capture",                             # 窗口采集
+    "monitor_capture", "display_capture",         # 显示器采集
+    "screen_capture", "xshm_input",               # macOS / Linux 屏幕采集
+    "pipewire-screen-capture-source",
+    "pipewire-desktop-capture-source",
 )
+# 音频源不能截图：GetSourceScreenshot 对音频源要么报错、要么给空画面。
+# 实测日志里选到「桌面音频」(wasapi_output_capture) 时，表现就是“已连接、
+# 一直没定位到风盘”——所以自动选源时必须先把音频源排除掉。
+AUDIO_INPUT_PREFIXES = ("wasapi_", "coreaudio_", "pulse_", "alsa_")
+AUDIO_INPUT_KINDS = {"audio_line", "audio_input", "audio_output", "audio_capture"}
+
+
+def _is_audio_input(kind: str) -> bool:
+    k = (kind or "").lower()
+    return k in AUDIO_INPUT_KINDS or k.startswith(AUDIO_INPUT_PREFIXES) or "audio" in k
+
+
 # 认不出类型时的源名兜底（多语言）
 DEFAULT_SOURCES = ("视频采集设备", "采集卡设备", "Video Capture Device", "視訊擷取裝置")
 
@@ -368,40 +386,61 @@ class ObsWebSocketSource:
         """
         挑源名，优先级：
           1) 传进来的 source（库里/命令行 --obs-source 可显式指定；默认 None 自动识别）
-          2) 按 inputKind 自动找采集设备（与界面语言无关）
+          2) 按 inputKind 自动找视频源（采集卡/游戏采集/窗口采集/显示器采集）
           3) 常见源名（多语言兜底）
-          4) 只有一个源 / 第一个源
+          4) 第一个非音频源
+          5) 只有音频源 → 明确报错，不能对着音频源截图
+
+        音频源必须跳过。以前没有这一步，用户在 OBS 里把「桌面音频」排在前面、
+        视频源又不是采集卡类型时，就会选中音频源，然后永远“没定位到风盘”。
         """
         names = [i["name"] for i in inputs]
+        kinds = {i["name"]: i.get("kind", "") for i in inputs}
         if source:                                   # 用户显式给了
             if not names or source in names:
+                if source in kinds and _is_audio_input(kinds[source]):
+                    raise RuntimeError(
+                        f"OBS 源「{source}」是音频源（{kinds[source]}），不能截图；"
+                        "请指定游戏画面的视频源（采集卡/游戏采集/窗口采集）。")
                 return source
             if len(names) == 1:                      # 只有一个源就直接用它
-                print(f"[提示] 没有「{source}」，改用唯一的源「{names[0]}」")
-                return names[0]
+                only = names[0]
+                if _is_audio_input(kinds.get(only, "")):
+                    raise RuntimeError(
+                        f"OBS 里只有音频源「{only}」（{kinds.get(only, '')}），"
+                        "没有可截图的视频源；请把游戏画面源加到当前场景。")
+                print(f"[提示] 没有「{source}」，改用唯一的源「{only}」")
+                return only
             print(f"[提示] OBS 里没有名为「{source}」的源，现有：")
             for n in names:
-                print(f"        - {n}")
+                print(f"        - {n} ({kinds.get(n, '')})")
             return source                            # 保持原样，让取帧报错
         if not inputs:                               # 列不出源：先用第一个候选
             return DEFAULT_SOURCES[0]
-        caps = [i for i in inputs
-                if any(i["kind"].startswith(k) for k in CAPTURE_INPUT_KINDS)]
+        videos = [i for i in inputs if not _is_audio_input(i.get("kind", ""))]
+        caps = [i for i in videos
+                if any((i.get("kind") or "").startswith(k) for k in CAPTURE_INPUT_KINDS)]
         if caps:                                     # 认出来了（不看名字也行）
             if len(caps) > 1:                        # 多个采集设备：优先常见名
                 for n in DEFAULT_SOURCES:
                     if n in {i["name"] for i in caps}:
                         return n
-                print("[提示] 发现多个采集设备，取第一个：" +
+                print("[提示] 发现多个视频源，取第一个：" +
                       "、".join(i["name"] for i in caps))
             return caps[0]["name"]
         for cand in DEFAULT_SOURCES:
-            if cand in names:
+            if cand in {i["name"] for i in videos}:
                 return cand
-        print(f"[提示] 没认出采集设备，改用第一个源「{names[0]}」，现有：")
-        for n in names:
-            print(f"        - {n}")
-        return names[0]
+        if videos:
+            print(f"[提示] 没认出视频采集源，改用第一个非音频源「{videos[0]['name']}」"
+                  f"({videos[0].get('kind', '')})，现有：")
+            for i in videos:
+                print(f"        - {i['name']} ({i.get('kind', '')})")
+            return videos[0]["name"]
+        raise RuntimeError(
+            "OBS 里只有音频源，没有可以截图的视频源：" +
+            "、".join(f"{i['name']}({i.get('kind', '')})" for i in inputs) +
+            "。请把游戏画面源加到当前场景。")
 
     def _inputs(self) -> list[dict]:
         """OBS 的输入源列表 [{name, kind}]；kind 是 inputKind，与界面语言无关。"""

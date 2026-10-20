@@ -13,7 +13,7 @@ __pycache__/
 
 # 运行时产生的日志 / 诊断图（就在程序旁边）
 NSSR日志/
-nssr-overlay.log*
+nssr-overlay*.log
 nssr-fail-*
 # 字形库总览图（排查用，随手生成）
 glyph_bank_preview.png

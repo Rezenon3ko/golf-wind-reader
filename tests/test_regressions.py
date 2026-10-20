@@ -322,6 +322,47 @@ class OcrTopologyRegressionTests(unittest.TestCase):
         return state
 
 
+class ObsSourcePickRegressionTests(unittest.TestCase):
+    def test_audio_source_is_skipped_for_capture_card(self):
+        inputs = [
+            {"name": "桌面音频", "kind": "wasapi_output_capture"},
+            {"name": "采集卡", "kind": "dshow_input"},
+        ]
+        self.assertEqual(O.ObsWebSocketSource._pick_source(None, inputs), "采集卡")
+
+    def test_game_capture_is_recognized(self):
+        inputs = [
+            {"name": "桌面音频", "kind": "wasapi_output_capture"},
+            {"name": "NSSR 游戏", "kind": "game_capture"},
+        ]
+        self.assertEqual(O.ObsWebSocketSource._pick_source(None, inputs), "NSSR 游戏")
+
+    def test_video_capture_wins_over_unrelated_video_source(self):
+        inputs = [
+            {"name": "桌面音频", "kind": "wasapi_output_capture"},
+            {"name": "图片", "kind": "image_source"},
+            {"name": "游戏窗口", "kind": "window_capture"},
+        ]
+        self.assertEqual(O.ObsWebSocketSource._pick_source(None, inputs), "游戏窗口")
+
+    def test_multiple_capture_sources_prefer_common_name(self):
+        inputs = [
+            {"name": "摄像头", "kind": "dshow_input"},
+            {"name": "采集卡设备", "kind": "dshow_input"},
+        ]
+        self.assertEqual(O.ObsWebSocketSource._pick_source(None, inputs), "采集卡设备")
+
+    def test_audio_only_raises_clear_error(self):
+        inputs = [{"name": "桌面音频", "kind": "wasapi_output_capture"}]
+        with self.assertRaisesRegex(RuntimeError, "只有音频源"):
+            O.ObsWebSocketSource._pick_source(None, inputs)
+
+    def test_explicit_audio_source_is_rejected(self):
+        inputs = [{"name": "桌面音频", "kind": "wasapi_output_capture"}]
+        with self.assertRaisesRegex(RuntimeError, "音频源"):
+            O.ObsWebSocketSource._pick_source("桌面音频", inputs)
+
+
 class InputRegressionTests(unittest.TestCase):
     def test_cli_accepts_obs_source(self):
         args = O.build_parser().parse_args(["--obs-source", "视频采集设备", "-t", "-v"])
